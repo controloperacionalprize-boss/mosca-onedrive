@@ -52,7 +52,12 @@ jobs:
           GITHUB_OWNER:        ${{ secrets.GITHUB_OWNER }}
           GITHUB_REPO:         ${{ secrets.GITHUB_REPO }}
           GITHUB_BRANCH:       main
-        run: python scripts/generar_mapa_automatico.py
+        run: |
+          echo "AQUAI vacía: ${{ secrets.ONEDRIVE_URL_AQUAI == '' }}"
+          echo "AQUAII vacía: ${{ secrets.ONEDRIVE_URL_AQUAII == '' }}"
+          echo "AQUAI len: ${#ONEDRIVE_URL_AQUAI}"
+          echo "AQUAII len: ${#ONEDRIVE_URL_AQUAII}"
+          python scripts/generar_mapa_automatico.py
 
       # ── 6. Resumen en Actions ──
       - name: 📋 Resumen
