@@ -888,14 +888,17 @@ def load_kmz_puntos(kmz_bytes_dict: dict) -> dict:
 # ============================================================
 # CARGAR DATOS EXCEL
 # ============================================================
-@st.cache_data(show_spinner="Cargando datos de trampas…", ttl=3600)
+@st.cache_data(show_spinner="Cargando datos de trampas…", ttl=300)  # ← TTL más corto (5 min)
 def load_trampas_anexadas() -> pd.DataFrame:
     import requests, io
 
     URL_AQUAI  = st.secrets.get("ONEDRIVE_URL_AQUAI",  "")
     URL_AQUAII = st.secrets.get("ONEDRIVE_URL_AQUAII", "")
-    st.sidebar.write("URL AQI:", URL_AQUAI[:60] if URL_AQUAI else "❌ VACÍA")
-    st.sidebar.write("URL AQII:", URL_AQUAII[:60] if URL_AQUAII else "❌ VACÍA")
+    
+    # ← DEBUG: mostrar URLs (primeros 80 caracteres)
+    st.sidebar.write("🔗 URL AQI:", URL_AQUAI[:80] if URL_AQUAI else "❌ VACÍA")
+    st.sidebar.write("🔗 URL AQII:", URL_AQUAII[:80] if URL_AQUAII else "❌ VACÍA")
+    
     ARCHIVOS = {
         "AQI":  (URL_AQUAI,  "Bdatos"),
         "AQII": (URL_AQUAII, "BDatos AQU II"),
@@ -911,9 +914,12 @@ def load_trampas_anexadas() -> pd.DataFrame:
         "CAPTURAS": str, "SEMANA": str, "AÑO": str,
     }
 
-    def _descargar(url: str) -> bytes | None:
+    def _descargar(url: str, nombre: str) -> bytes | None:
+        """Descargar con debug detallado"""
         if not url:
+            st.sidebar.error(f"❌ {nombre}: URL vacía en secrets.toml")
             return None
+        
         try:
             headers = {
                 "User-Agent": "Mozilla/5.0",
@@ -921,25 +927,51 @@ def load_trampas_anexadas() -> pd.DataFrame:
             }
             resp = requests.get(
                 url, headers=headers,
-                timeout=60, allow_redirects=True
+                timeout=30,  # ← Reducir timeout
+                allow_redirects=True
             )
+            
             if resp.status_code == 200:
-                # Verificar que sea un Excel real, no HTML de login
                 content_type = resp.headers.get("Content-Type", "")
+                
+                # ← DEBUG detallado
+                st.sidebar.caption(
+                    f"📥 {nombre}: HTTP 200, Content-Type: {content_type[:40]}"
+                )
+                
                 if "html" in content_type:
-                    st.sidebar.warning("⚠️ Link expirado o requiere login")
+                    st.sidebar.error(
+                        f"❌ {nombre}: Recibió HTML (link expirado/requiere login)"
+                    )
                     return None
-                return resp.content
-            st.sidebar.warning(f"⚠️ HTTP {resp.status_code}")
+                
+                if "spreadsheet" in content_type or "excel" in content_type or len(resp.content) > 10000:
+                    st.sidebar.success(f"✅ {nombre}: {len(resp.content):,} bytes descargados")
+                    return resp.content
+                else:
+                    st.sidebar.warning(
+                        f"⚠️ {nombre}: Respuesta sospechosa ({len(resp.content)} bytes, "
+                        f"Content-Type: {content_type})"
+                    )
+                    return None
+            else:
+                st.sidebar.error(f"❌ {nombre}: HTTP {resp.status_code}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            st.sidebar.error(f"❌ {nombre}: Timeout (30s)")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            st.sidebar.error(f"❌ {nombre}: Sin conexión — {str(e)[:60]}")
             return None
         except Exception as e:
-            st.sidebar.warning(f"⚠️ Error descarga: {e}")
+            st.sidebar.error(f"❌ {nombre}: {type(e).__name__}: {str(e)[:80]}")
             return None
 
-    # ── Intentar SharePoint público ──
+    # ── Intentar SharePoint ──
     dfs = []
     for key, (url, sheet) in ARCHIVOS.items():
-        contenido = _descargar(url)
+        contenido = _descargar(url, key)
         if contenido:
             try:
                 df_tmp = pd.read_excel(
@@ -950,23 +982,23 @@ def load_trampas_anexadas() -> pd.DataFrame:
                     dtype=DTYPE_MAP,
                 )
                 dfs.append(df_tmp)
-                st.sidebar.caption(f"✅ {key}: {len(df_tmp)} filas")
+                st.sidebar.success(f"✅ {key}: {len(df_tmp)} filas desde SharePoint")
             except Exception as e:
-                st.sidebar.warning(f"⚠️ Error leyendo Excel {key}: {e}")
+                st.sidebar.error(f"⚠️ Error leyendo {key}: {e}")
         else:
-            st.sidebar.warning(f"⚠️ {key}: descarga fallida")
+            st.sidebar.warning(f"⚠️ {key}: Fallando a local")
 
-    # ── Fallback local ──
+    # ── Fallback local SOLO si SharePoint falló ──
     if not dfs:
-        st.sidebar.info("📂 SharePoint no disponible — archivos locales")
+        st.sidebar.warning("📂 SharePoint no disponible — usando archivos locales")
         path_aquai  = r"C:\Users\lperez.LPEREZPRUEBA\operaciones_control\OPERACIONES\PRODUCCION_MOSCA\data\BD_Mosca_Fruta_AQUAI.xlsx"
         path_aquaii = r"C:\Users\lperez.LPEREZPRUEBA\operaciones_control\OPERACIONES\PRODUCCION_MOSCA\data\BD_Mosca_Fruta_AQUAII.xlsx"
         try:
             dfs.append(pd.read_excel(path_aquai,  sheet_name="Bdatos",        engine="openpyxl", usecols=lambda c: c in COLS, dtype=DTYPE_MAP))
             dfs.append(pd.read_excel(path_aquaii, sheet_name="BDatos AQU II", engine="openpyxl", usecols=lambda c: c in COLS, dtype=DTYPE_MAP))
-            st.sidebar.caption("📂 Archivos locales OK")
-        except FileNotFoundError:
-            st.error("❌ Sin datos disponibles")
+            st.sidebar.info("📂 Cargado desde archivos locales")
+        except FileNotFoundError as e:
+            st.error(f"❌ Sin datos: {e}")
             return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True, copy=False)
