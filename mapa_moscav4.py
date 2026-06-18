@@ -5,7 +5,9 @@ from pathlib import Path
 import json
 from datetime import datetime
 import re
-
+import pyodbc
+import struct
+import msal
 st.set_page_config(
     page_title="Mapa Epidemiológico - Mosca de la Fruta",
     layout="wide",
@@ -14,7 +16,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1rem; }
+    .block-container { padding-top: 3rem; }
     #MainMenu, footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -32,9 +34,9 @@ def norm_mod(val) -> int | None:
     if match:
         return int(match.group(1))
 
-    # M01, M02, M03, M1, M2 (solo, sin guion después) → número
+    # M01, M02, M10A, M10B (con sufijo letra opcional) → número
     # Pero NO capturar M01-T3 (eso es turno compuesto)
-    match = re.match(r'^M\s*0*(\d+)$', s)
+    match = re.match(r'^M\s*0*(\d+)[A-Z]?$', s)  # ← añadir [A-Z]?
     if match:
         return int(match.group(1))
 
@@ -253,11 +255,6 @@ def calcular_lotes_con_centroide(valid: pd.DataFrame, kmz_polygons: list[dict]) 
             "fundo_aq": fundo_aq, # ← normalizado
         })
 
-    st.sidebar.caption(
-        f"🔗 Con KMZ: {con_kmz_count} | "
-        f"Fallback GPS: {sin_match} | "
-        f"Total: {len(lotes_markers)}"
-    )
 
     return lotes_markers
 # ============================================================
@@ -721,17 +718,6 @@ def load_kmz_local(kmz_path: str = "data/MODULOS_PRIZE_PAIJAN.kmz"):
                     })
 
                 if polygons:
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Polígonos", len(polygons))
-                    with col2:
-                        st.metric("Módulos", len(set(p['mod_n'] for p in polygons)))
-                    with col3:
-                        st.metric("Turnos",  len(set(p['tur_n'] for p in polygons)))
-                    with col4:
-                        st.metric("Lotes",   len(set(p['lote']  for p in polygons)))
-
-                  
                     return polygons
                 else:
                     st.error("❌ No se encontraron polígonos válidos")
@@ -880,155 +866,173 @@ def load_kmz_puntos(kmz_bytes_dict: dict) -> dict:
                 puntos_index[key] = {"lat": lat, "lon": lon, "name": name}
                 ok += 1
 
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ Error KMZ puntos {kmz_key}: {e}")
+        except Exception:
+            continue
 
-    st.sidebar.caption(f"📍 Puntos GPS: {ok}/{total} cargados")
     return puntos_index
 # ============================================================
 # CARGAR DATOS EXCEL
 # ============================================================
-@st.cache_data(show_spinner="Cargando datos de trampas…", ttl=300)  # ← TTL más corto (5 min)
+
+_MSAL_CLIENT_ID  = "2fd908ad-0664-4344-b9be-cd3e8b574c38"
+_MSAL_SCOPES     = ["https://database.windows.net//.default"]
+_MSAL_AUTHORITY  = "https://login.microsoftonline.com/964baec1-d23b-4d2d-bfa9-1344054ea654"
+ 
+ 
+@st.cache_resource
+def _get_msal_app():
+    return msal.PublicClientApplication(client_id=_MSAL_CLIENT_ID, authority=_MSAL_AUTHORITY)
+ 
+ 
+def _get_access_token():
+    app = _get_msal_app()
+    cfg = st.secrets["database"]
+    accounts = app.get_accounts(username=cfg["username"])
+    result = app.acquire_token_silent(_MSAL_SCOPES, account=accounts[0]) if accounts else None
+    if result and "access_token" in result:
+        return result["access_token"]
+ 
+    flow = app.initiate_device_flow(scopes=_MSAL_SCOPES)
+    st.warning(
+        f"**Autenticación requerida** — Ve a [microsoft.com/devicelogin](https://microsoft.com/devicelogin) "
+        f"e ingresa el código: **`{flow['user_code']}`**"
+    )
+    with st.spinner("Esperando autenticación..."):
+        result = app.acquire_token_by_device_flow(flow)
+ 
+    if "access_token" not in result:
+        st.error("❌ Error de autenticación MSAL")
+        st.stop()
+ 
+    return result["access_token"]
+ 
+ 
+def _get_connection():
+    cfg = st.secrets["database"]
+    token_bytes  = _get_access_token().encode("utf-16-le")
+    token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+    conn_str = (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        f"SERVER={cfg['server']};DATABASE={cfg['database']};"
+        "Encrypt=yes;TrustServerCertificate=no;"
+    )
+    return pyodbc.connect(conn_str, attrs_before={1256: token_struct}, timeout=30)
+ 
+ 
+def get_conn():
+    """Alias para mantener compatibilidad con el resto del script."""
+    try:
+        return _get_connection()
+    except Exception as e:
+        return None
+ 
+ 
+# ============================================================
+# CARGAR DATOS DESDE SQL SERVER / FABRIC
+# ============================================================
+ 
+@st.cache_data(show_spinner="Cargando datos de trampas desde Fabric…", ttl=300)
 def load_trampas_anexadas() -> pd.DataFrame:
-    import requests, io
-
-    URL_AQUAI  = st.secrets.get("ONEDRIVE_URL_AQUAI",  "")
-    URL_AQUAII = st.secrets.get("ONEDRIVE_URL_AQUAII", "")
-    
-    # ← DEBUG: mostrar URLs (primeros 80 caracteres)
-    st.sidebar.write("🔗 URL AQI:", URL_AQUAI[:80] if URL_AQUAI else "❌ VACÍA")
-    st.sidebar.write("🔗 URL AQII:", URL_AQUAII[:80] if URL_AQUAII else "❌ VACÍA")
-    
-    ARCHIVOS = {
-        "AQI":  (URL_AQUAI,  "Bdatos"),
-        "AQII": (URL_AQUAII, "BDatos AQU II"),
-    }
-
-    COLS = ["LATITUD", "LONGITUD", "FECHA", "FUNDO", "MODULO",
-            "TURNO", "TRAMPA", "CAPTURAS", "LOTE", "EMPRESA",
-            "SEMANA", "AÑO", "TIPO DE TRAMPA"]
-
-    DTYPE_MAP = {
-        "FUNDO": str, "MODULO": str, "TURNO": str, "TRAMPA": str,
-        "LOTE": str,  "EMPRESA": str, "TIPO DE TRAMPA": str,
-        "CAPTURAS": str, "SEMANA": str, "AÑO": str,
-    }
-
-    def _descargar(url: str, nombre: str) -> bytes | None:
-        """Descargar con debug detallado"""
-        if not url:
-            st.sidebar.error(f"❌ {nombre}: URL vacía en secrets.toml")
-            return None
-        
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Accept":     "application/octet-stream",
-            }
-            resp = requests.get(
-                url, headers=headers,
-                timeout=30,  # ← Reducir timeout
-                allow_redirects=True
-            )
-            
-            if resp.status_code == 200:
-                content_type = resp.headers.get("Content-Type", "")
-                
-                # ← DEBUG detallado
-                st.sidebar.caption(
-                    f"📥 {nombre}: HTTP 200, Content-Type: {content_type[:40]}"
-                )
-                
-                if "html" in content_type:
-                    st.sidebar.error(
-                        f"❌ {nombre}: Recibió HTML (link expirado/requiere login)"
-                    )
-                    return None
-                
-                if "spreadsheet" in content_type or "excel" in content_type or len(resp.content) > 10000:
-                    st.sidebar.success(f"✅ {nombre}: {len(resp.content):,} bytes descargados")
-                    return resp.content
-                else:
-                    st.sidebar.warning(
-                        f"⚠️ {nombre}: Respuesta sospechosa ({len(resp.content)} bytes, "
-                        f"Content-Type: {content_type})"
-                    )
-                    return None
-            else:
-                st.sidebar.error(f"❌ {nombre}: HTTP {resp.status_code}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            st.sidebar.error(f"❌ {nombre}: Timeout (30s)")
-            return None
-        except requests.exceptions.ConnectionError as e:
-            st.sidebar.error(f"❌ {nombre}: Sin conexión — {str(e)[:60]}")
-            return None
-        except Exception as e:
-            st.sidebar.error(f"❌ {nombre}: {type(e).__name__}: {str(e)[:80]}")
-            return None
-
-    # ── Intentar SharePoint ──
-    dfs = []
-    for key, (url, sheet) in ARCHIVOS.items():
-        contenido = _descargar(url, key)
-        if contenido:
-            try:
-                df_tmp = pd.read_excel(
-                    io.BytesIO(contenido),
-                    sheet_name=sheet,
-                    engine="openpyxl",
-                    usecols=lambda c: c in COLS,
-                    dtype=DTYPE_MAP,
-                )
-                dfs.append(df_tmp)
-                st.sidebar.success(f"✅ {key}: {len(df_tmp)} filas desde SharePoint")
-            except Exception as e:
-                st.sidebar.error(f"⚠️ Error leyendo {key}: {e}")
-        else:
-            st.sidebar.warning(f"⚠️ {key}: Fallando a local")
-
-    # ── Fallback local SOLO si SharePoint falló ──
-    if not dfs:
-        st.sidebar.warning("📂 SharePoint no disponible — usando archivos locales")
-        path_aquai  = r"C:\Users\lperez.LPEREZPRUEBA\operaciones_control\OPERACIONES\PRODUCCION_MOSCA\data\BD_Mosca_Fruta_AQUAI.xlsx"
-        path_aquaii = r"C:\Users\lperez.LPEREZPRUEBA\operaciones_control\OPERACIONES\PRODUCCION_MOSCA\data\BD_Mosca_Fruta_AQUAII.xlsx"
-        try:
-            dfs.append(pd.read_excel(path_aquai,  sheet_name="Bdatos",        engine="openpyxl", usecols=lambda c: c in COLS, dtype=DTYPE_MAP))
-            dfs.append(pd.read_excel(path_aquaii, sheet_name="BDatos AQU II", engine="openpyxl", usecols=lambda c: c in COLS, dtype=DTYPE_MAP))
-            st.sidebar.info("📂 Cargado desde archivos locales")
-        except FileNotFoundError as e:
-            st.error(f"❌ Sin datos: {e}")
-            return pd.DataFrame()
-
-    df = pd.concat(dfs, ignore_index=True, copy=False)
-
-    rename_map = {
-        "LATITUD": "lat", "LONGITUD": "lon", "FECHA": "fecha",
-        "FUNDO": "fundo", "MODULO": "modulo", "TURNO": "turno",
-        "TRAMPA": "trampa", "CAPTURAS": "capturas", "LOTE": "lote",
-        "EMPRESA": "empresa", "SEMANA": "semana", "AÑO": "anio",
+    """
+    Lee la tabla MOSQUITA desde SQL Server / Fabric vía MSAL.
+ 
+    Columnas reales en MOSQUITA:
+        FUNDO, FECHA, TRAMPA, MES, AÑO, SEMANA, MODULO, TURNO,
+        LOTE, TIPO DE TRAMPA, CAPTURAS, N° TRAMPAS, MTD
+ 
+    Nota: la tabla NO tiene LATITUD/LONGITUD — las coordenadas
+    vendrán 100% del KMZ (centroide por fundo/modulo/turno/lote).
+    """
+ 
+    RENAME_MAP = {
+        "FUNDO":          "fundo",
+        "FECHA":          "fecha",
+        "TRAMPA":         "trampa",
+        "MES":            "mes",
+        "AÑO":            "anio",
+        "SEMANA":         "semana",
+        "MODULO":         "modulo",
+        "TURNO":          "turno",
+        "LOTE":           "lote",
         "TIPO DE TRAMPA": "tipo_trampa",
+        "CAPTURAS":       "capturas",
+        "N° TRAMPAS":     "n_trampas",
+        "MTD":            "mtd",
     }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-    df["lat"]      = pd.to_numeric(df["lat"],      errors="coerce")
-    df["lon"]      = pd.to_numeric(df["lon"],      errors="coerce")
-    df["capturas"] = pd.to_numeric(df["capturas"], errors="coerce").fillna(0).astype(int)
-    df["fecha"]    = pd.to_datetime(df["fecha"], dayfirst=True, errors="coerce").dt.date
-    df["anio"]     = pd.to_numeric(df["anio"],     errors="coerce").astype('Int64')
-    df["semana"]   = pd.to_numeric(df["semana"],   errors="coerce").astype('Int64')
-
-    for c in ["empresa", "fundo", "modulo", "turno", "trampa", "lote", "tipo_trampa"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
-
-    mask_lat_ok = df["lat"].isna() | df["lat"].between(-90, 90)
-    mask_lon_ok = df["lon"].isna() | df["lon"].between(-180, 180)
-    df = df[mask_lat_ok & mask_lon_ok].copy()
+ 
+    QUERY = """
+        SELECT
+            FUNDO,
+            FECHA,
+            TRAMPA,
+            MES,
+            [AÑO],
+            SEMANA,
+            MODULO,
+            TURNO,
+            LOTE,
+            [TIPO DE TRAMPA],
+            CAPTURAS,
+            [N° TRAMPAS],
+            MTD
+        FROM MOSQUITA
+    """
+ 
+    conn = get_conn()
+    if conn is None:
+        return _df_vacio_con_columnas()
+ 
+    try:
+        st.sidebar.caption("🔌 Conectado a Fabric — leyendo MOSQUITA…")
+        df = pd.read_sql(QUERY, conn)
+        st.sidebar.success(f"✅ Fabric: {len(df):,} filas cargadas")
+    except Exception as e:
+        return _df_vacio_con_columnas()
+    finally:
+        conn.close()
+ 
+    if df.empty:
+        return _df_vacio_con_columnas()
+ 
+    # ── Renombrar columnas ────────────────────────────────────
+    df = df.rename(columns={k: v for k, v in RENAME_MAP.items() if k in df.columns})
+ 
+    # ── Tipos numéricos ──────────────────────────────────────
+    df["capturas"]  = pd.to_numeric(df.get("capturas"),  errors="coerce").fillna(0).astype(int)
+    df["anio"]      = pd.to_numeric(df.get("anio"),      errors="coerce").astype("Int64")
+    df["semana"]    = pd.to_numeric(df.get("semana"),    errors="coerce").astype("Int64")
+    df["n_trampas"] = pd.to_numeric(df.get("n_trampas"), errors="coerce")
+    df["mtd"]       = pd.to_numeric(df.get("mtd"),       errors="coerce")
+ 
+    # ── Fecha ────────────────────────────────────────────────
+    df["fecha"] = pd.to_datetime(df.get("fecha"), errors="coerce").dt.date
+ 
+    # ── Strings limpios ──────────────────────────────────────
+    for col in ["fundo", "modulo", "turno", "trampa", "lote", "tipo_trampa", "mes"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+ 
+    # ── Columnas lat/lon ficticias (el KMZ las resuelve) ─────
+    df["lat"] = float("nan")
+    df["lon"] = float("nan")
+ 
+    # ── Filtrar solo año 2026 ────────────────────────────────
     df = df[df["anio"] == 2026].copy()
-
+ 
     return df
+ 
+ 
+def _df_vacio_con_columnas() -> pd.DataFrame:
+    """
+    DataFrame vacío PERO con todas las columnas que el resto del
+    script espera (evita KeyError: 'trampa', etc. si la conexión falla).
+    """
+    cols = [
+        "fundo", "fecha", "trampa", "mes", "anio", "semana",
+        "modulo", "turno", "lote", "tipo_trampa", "capturas",
+        "n_trampas", "mtd", "lat", "lon",
+    ]
+    return pd.DataFrame(columns=cols)
 # ============================================================
 # SIDEBAR - FILTROS COMPLETOS
 # ============================================================
@@ -1045,9 +1049,6 @@ st.sidebar.markdown("---")
 # CARGAR DATOS EXCEL Y KMZ
 # ============================================================
 df = load_trampas_anexadas()
-with st.sidebar.expander("🔍 DEBUG: Trampas únicas", expanded=True):
-    st.write(sorted(df["trampa"].dropna().unique().tolist()))
-    st.write(f"Total tipos: {df['trampa'].nunique()}")
 @st.cache_data(show_spinner="Descargando KMZ desde GitHub…")
 def download_kmz_from_github() -> bytes | None:
     import urllib.request, urllib.error
@@ -1061,13 +1062,11 @@ def download_kmz_from_github() -> bytes | None:
     if token:
         headers["Authorization"] = f"token {token}"
 
-    st.sidebar.caption(f"🔑 KMZ Token: {'✅' if token else '❌ vacío'}")
 
     try:
         req  = urllib.request.Request(api_url, headers=headers)
         resp = urllib.request.urlopen(req, timeout=30)
         data = resp.read()
-        st.sidebar.caption(f"✅ KMZ: {len(data):,} bytes")
         return data
     except urllib.error.HTTPError as e:
         st.sidebar.error(f"❌ KMZ HTTP {e.code}: {e.reason}")
@@ -1179,6 +1178,8 @@ if sel_sem_verde:    cats_permitidas.add(1)
 if sel_sem_amarillo: cats_permitidas.add(2)
 if sel_sem_naranja:  cats_permitidas.add(3)
 if sel_sem_rojo_f:   cats_permitidas.add(4)
+
+
 
 if not dff.empty:
     dff["_cat"] = dff["capturas"].apply(get_semaforo_category)
@@ -1419,7 +1420,78 @@ data_json = json.dumps({
     "githubToken": "",   # ← vacío, el token se usa solo en Python
     "contornos":   contornos,
     "lotes":       lotes_etiquetas,
-}, separators=(",", ":"), ensure_ascii=False)
+}, separators=(",", ":"), ensure_ascii=False)# ============================================================
+# PANEL DE KPIs (estilo tarjeta)
+# ============================================================
+def _calcular_semana_anterior(df_completo: pd.DataFrame, semana_actual: int | None):
+    if semana_actual is None:
+        return None
+    semanas_disponibles = sorted(df_completo["semana"].dropna().unique().tolist())
+    anteriores = [s for s in semanas_disponibles if s < semana_actual]
+    if not anteriores:
+        return None
+    semana_prev = max(anteriores)
+    return df_completo[df_completo["semana"] == semana_prev].copy()
+
+
+def _delta_pct(actual: float, anterior: float) -> float | None:
+    if not anterior or pd.isna(anterior):
+        return None
+    return ((actual - anterior) / anterior) * 100
+
+
+semana_sel_actual = int(sel_semana_val) if sel_semana_val != "Todos" else None
+df_prev = _calcular_semana_anterior(df, semana_sel_actual)
+
+capturas_totales = int(dff["capturas"].sum()) if not dff.empty else 0
+trampas_activas  = dff["trampa"].nunique() if not dff.empty else 0
+promedio_trampa  = (capturas_totales / trampas_activas) if trampas_activas else 0.0
+zonas_alerta     = sum(1 for m in lotes_markers if get_semaforo_category(m["capturas"]) == 4) if lotes_markers else 0
+
+if df_prev is not None and not df_prev.empty:
+    capturas_prev = int(df_prev["capturas"].sum())
+    trampas_prev  = df_prev["trampa"].nunique()
+    promedio_prev = (capturas_prev / trampas_prev) if trampas_prev else 0.0
+    zonas_prev    = None  # no se recalcula KMZ histórico por semana, se omite delta
+
+    delta_capturas = _delta_pct(capturas_totales, capturas_prev)
+    delta_promedio = _delta_pct(promedio_trampa,  promedio_prev)
+else:
+    delta_capturas = delta_promedio = None
+
+def _badge(delta: float | None) -> str:
+    if delta is None:
+        return ""
+    positivo = delta >= 0
+    color_bg = "#E1F5EE" if positivo else "#FAECE7"
+    color_txt = "#085041" if positivo else "#712B13"
+    flecha = "▲" if positivo else "▼"
+    return f'<span style="background:{color_bg};color:{color_txt};font-size:12px;font-weight:500;padding:2px 8px;border-radius:6px;display:inline-flex;align-items:center;gap:3px;">{flecha} {abs(delta):.1f}%</span>'
+
+def _tarjeta_kpi(icono, label, valor, sufijo_html="", color_valor="inherit"):
+    return (
+        f'<div style="background:var(--background-color,#fff);border:1px solid rgba(128,128,128,0.18);border-radius:12px;padding:16px 18px;flex:1;min-width:160px;">'
+        f'<div style="font-size:13px;color:rgba(128,128,128,0.9);margin-bottom:6px;display:flex;align-items:center;gap:6px;">'
+        f'<span>{icono}</span><span>{label}</span></div>'
+        f'<div style="font-size:26px;font-weight:600;color:{color_valor};line-height:1.2;">{valor}</div>'
+        f'<div style="margin-top:8px;min-height:22px;">{sufijo_html}</div>'
+        f'</div>'
+    )
+
+sufijo_semana = ""
+if sel_semana_val != "Todos":
+    sufijo_semana = f'<span style="font-size:12px;color:rgba(128,128,128,0.85);">Semana {sel_semana_val}</span>'
+
+kpi_html = (
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:1.2rem;">'
+    + _tarjeta_kpi("📊", "Capturas totales", f"{capturas_totales:,}", _badge(delta_capturas) or sufijo_semana)
+    + _tarjeta_kpi("📈", "Promedio / trampa", f"{promedio_trampa:.1f}", _badge(delta_promedio))
+    + _tarjeta_kpi("📍", "Trampas activas", f"{trampas_activas:,}")
+    + _tarjeta_kpi("🔴", "Zonas en alerta", f"{zonas_alerta}", color_valor="#D85A30" if zonas_alerta > 0 else "inherit")
+    + '</div>'
+)
+
+st.markdown(kpi_html, unsafe_allow_html=True)
 
 # ============================================================
 # MAPA CON COMPONENTE JAVASCRIPT
@@ -1522,15 +1594,13 @@ def _push_file_github(api_url, contenido, branch, mensaje, headers, es_binario=F
         resp = urllib.request.urlopen(req, timeout=10)
         data = json.loads(resp.read())
         sha  = data.get("sha")
-        st.sidebar.caption(f"📌 SHA encontrado: {sha[:7] if sha else 'None'}")  # ← debug
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            st.sidebar.caption("📌 Archivo nuevo (no existe aún)")
+            pass
         else:
             return False, f"Error leyendo archivo ({e.code})"
     except Exception as ex:
         return False, f"Error de red: {ex}"
-
     content_b64 = (
         base64.b64encode(contenido).decode()
         if es_binario
@@ -1546,11 +1616,9 @@ def _push_file_github(api_url, contenido, branch, mensaje, headers, es_binario=F
         resp = urllib.request.urlopen(req, timeout=60)
         result = json.loads(resp.read())
         sha_nuevo = result.get("content", {}).get("sha", "")
-        st.sidebar.caption(f"✅ Subido OK, nuevo SHA: {sha_nuevo[:7] if sha_nuevo else '?'}")
         return True, ""
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:300]
-        st.sidebar.caption(f"❌ PUT falló: {body}")
         return False, f"GitHub API error {e.code}: {body}"
     except Exception as ex:
         return False, f"Error: {ex}"
@@ -1660,7 +1728,7 @@ col_pub, col_png = st.sidebar.columns([1, 1])
 
 with col_pub:
     if st.button("🚀 Publicar HTML", use_container_width=True, key="btn_pub_html"):
-        with st.spinner("Subiendo a GitHub Pages..."):
+        with st.spinner("Publicando Pagina..."):
             ok, resultado = _subir_html_a_github(html_with_data)
         if ok:
             st.sidebar.success("✅ Publicado")
@@ -1913,7 +1981,7 @@ with col_png:
 
                     ok_png, res_png = _subir_png_a_github(png_bytes)
                     if ok_png:
-                        st.sidebar.success("✅ PNG guardado en GitHub")
+                        st.sidebar.success("✅ PNG guardado en enlace")
                         st.sidebar.markdown(f"[🔗 Ver PNG]({res_png})", unsafe_allow_html=True)
                     else:
                         st.sidebar.warning(f"PNG local OK, GitHub falló: {res_png}")
