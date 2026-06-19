@@ -932,95 +932,64 @@ def get_conn():
 # ============================================================
  
 @st.cache_data(show_spinner="Cargando datos de trampas desde Fabric…", ttl=300)
-def load_trampas_anexadas() -> pd.DataFrame:
-    """
-    Lee la tabla MOSQUITA desde SQL Server / Fabric vía MSAL.
- 
-    Columnas reales en MOSQUITA:
-        FUNDO, FECHA, TRAMPA, MES, AÑO, SEMANA, MODULO, TURNO,
-        LOTE, TIPO DE TRAMPA, CAPTURAS, N° TRAMPAS, MTD
- 
-    Nota: la tabla NO tiene LATITUD/LONGITUD — las coordenadas
-    vendrán 100% del KMZ (centroide por fundo/modulo/turno/lote).
-    """
- 
+def _query_mosquita(token: str) -> pd.DataFrame:
+    """Recibe el token ya obtenido y hace solo la query SQL."""
     RENAME_MAP = {
-        "FUNDO":          "fundo",
-        "FECHA":          "fecha",
-        "TRAMPA":         "trampa",
-        "MES":            "mes",
-        "AÑO":            "anio",
-        "SEMANA":         "semana",
-        "MODULO":         "modulo",
-        "TURNO":          "turno",
-        "LOTE":           "lote",
-        "TIPO DE TRAMPA": "tipo_trampa",
-        "CAPTURAS":       "capturas",
-        "N° TRAMPAS":     "n_trampas",
-        "MTD":            "mtd",
+        "FUNDO": "fundo", "FECHA": "fecha", "TRAMPA": "trampa",
+        "MES": "mes", "AÑO": "anio", "SEMANA": "semana",
+        "MODULO": "modulo", "TURNO": "turno", "LOTE": "lote",
+        "TIPO DE TRAMPA": "tipo_trampa", "CAPTURAS": "capturas",
+        "N° TRAMPAS": "n_trampas", "MTD": "mtd",
     }
- 
     QUERY = """
-        SELECT
-            FUNDO,
-            FECHA,
-            TRAMPA,
-            MES,
-            [AÑO],
-            SEMANA,
-            MODULO,
-            TURNO,
-            LOTE,
-            [TIPO DE TRAMPA],
-            CAPTURAS,
-            [N° TRAMPAS],
-            MTD
+        SELECT FUNDO, FECHA, TRAMPA, MES, [AÑO], SEMANA, MODULO,
+               TURNO, LOTE, [TIPO DE TRAMPA], CAPTURAS, [N° TRAMPAS], MTD
         FROM MOSQUITA
     """
- 
-    conn = get_conn()
-    if conn is None:
-        return _df_vacio_con_columnas()
- 
     try:
-        st.sidebar.caption("🔌 Conectado a Fabric — leyendo MOSQUITA…")
-        df = pd.read_sql(QUERY, conn)
-        st.sidebar.success(f"✅ Fabric: {len(df):,} filas cargadas")
-    except Exception as e:
-        return _df_vacio_con_columnas()
-    finally:
+        cfg = st.secrets["database"]
+        token_bytes  = token.encode("utf-16-le")
+        token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+        conn_str = (
+            "DRIVER={ODBC Driver 17 for SQL Server};"
+            f"SERVER={cfg['server']};DATABASE={cfg['database']};"
+            "Encrypt=yes;TrustServerCertificate=no;"
+        )
+        conn = pyodbc.connect(conn_str, attrs_before={1256: token_struct}, timeout=30)
+        df   = pd.read_sql(QUERY, conn)
         conn.close()
- 
+    except Exception as e:
+        st.sidebar.error(f"❌ Error query: {e}")
+        return _df_vacio_con_columnas()
+
     if df.empty:
         return _df_vacio_con_columnas()
- 
-    # ── Renombrar columnas ────────────────────────────────────
+
     df = df.rename(columns={k: v for k, v in RENAME_MAP.items() if k in df.columns})
- 
-    # ── Tipos numéricos ──────────────────────────────────────
     df["capturas"]  = pd.to_numeric(df.get("capturas"),  errors="coerce").fillna(0).astype(int)
     df["anio"]      = pd.to_numeric(df.get("anio"),      errors="coerce").astype("Int64")
-    df["semana"]    = pd.to_numeric(df.get("semana"),    errors="coerce").astype("Int64")
+    df["semana"]    = pd.to_numeric(df.get("semana"),     errors="coerce").astype("Int64")
     df["n_trampas"] = pd.to_numeric(df.get("n_trampas"), errors="coerce")
-    df["mtd"]       = pd.to_numeric(df.get("mtd"),       errors="coerce")
- 
-    # ── Fecha ────────────────────────────────────────────────
-    df["fecha"] = pd.to_datetime(df.get("fecha"), errors="coerce").dt.date
- 
-    # ── Strings limpios ──────────────────────────────────────
+    df["mtd"]       = pd.to_numeric(df.get("mtd"),        errors="coerce")
+    df["fecha"]     = pd.to_datetime(df.get("fecha"),     errors="coerce").dt.date
     for col in ["fundo", "modulo", "turno", "trampa", "lote", "tipo_trampa", "mes"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
- 
-    # ── Columnas lat/lon ficticias (el KMZ las resuelve) ─────
     df["lat"] = float("nan")
-    df["lon"] = float("nan")
- 
-    # ── Filtrar solo año 2026 ────────────────────────────────
+    df["lon"]  = float("nan")
     df = df[df["anio"] == 2026].copy()
- 
     return df
- 
+
+
+def load_trampas_anexadas() -> pd.DataFrame:
+    """
+    Obtiene token FUERA del cache (puede mostrar widgets),
+    luego llama a la función cacheada que solo hace SQL.
+    """
+    token = _get_access_token()   # ← widgets (st.warning/spinner) aquí, fuera del cache
+    if not token:
+        return _df_vacio_con_columnas()
+    return _query_mosquita(token) # ← cache aquí, sin widgets
  
 def _df_vacio_con_columnas() -> pd.DataFrame:
     """
@@ -1556,10 +1525,6 @@ if lotes_markers:
                 "Keys KMZ disponibles": ", ".join(sorted(set(similares))[:4]) or "❌ Sin módulo en KMZ",
             })
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("✅ Con match KMZ", len(con_kmz))
-    col2.metric("⚠️ Sin match KMZ", len(rows_sin))
-    col3.metric("📊 Total trampas", len(lotes_markers))
 
     if rows_sin:
         with st.expander(f"⚠️ {len(rows_sin)} lotes sin match KMZ — ver detalle", expanded=False):
