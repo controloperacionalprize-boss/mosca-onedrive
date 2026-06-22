@@ -1946,19 +1946,42 @@ with col_png:
 
                     ok_png, res_png = _subir_png_a_github(png_bytes)
                     if ok_png:
-                        st.sidebar.success("✅ PNG guardado en enlace")
+                        st.sidebar.success("✅ PNG publicado")
                         st.sidebar.markdown(f"[🔗 Ver PNG]({res_png})", unsafe_allow_html=True)
+
+                        import base64
+                        nombre_png = f"mapa_mosca_{_build_sufijo()}.png"
+                        b64 = base64.b64encode(png_bytes).decode()
+                        st.components.v1.html(
+                            f"""
+                            <html><body>
+                            <script>
+                            (function() {{
+                                try {{
+                                    const b64 = '{b64}';
+                                    const bin = atob(b64);
+                                    const arr = new Uint8Array(bin.length);
+                                    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                                    const blob = new Blob([arr], {{type: 'image/png'}});
+                                    const url  = URL.createObjectURL(blob);
+                                    const a    = document.createElement('a');
+                                    a.href     = url;
+                                    a.download = '{nombre_png}';
+                                    document.body.appendChild(a);
+                                    a.click();
+                                    document.body.removeChild(a);
+                                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                                }} catch(e) {{
+                                    console.error('descarga error:', e);
+                                }}
+                            }})();
+                            </script>
+                            </body></html>
+                            """,
+                            height=0,
+                        )
                     else:
-                        st.sidebar.warning(f"PNG local OK, GitHub falló: {res_png}")
-
-                    st.sidebar.download_button(
-                        label="⬇️ Descargar PNG",
-                        data=png_bytes,
-                        file_name=f"mapa_mosca_{_build_sufijo()}.png",
-                        mime="image/png",
-                        key="btn_dl_png"
-                    )
-
+                        st.sidebar.warning(f"PNG local OK, GitHub falló: {res_png}")  
             except Exception as e:
                 st.sidebar.error(f"Error generando PNG: {e}")
                 import traceback
