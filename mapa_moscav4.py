@@ -8,6 +8,8 @@ import re
 import pyodbc
 import struct
 import msal
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 st.set_page_config(
     page_title="Mapa Epidemiológico - Mosca de la Fruta",
     layout="wide",
@@ -1461,8 +1463,286 @@ kpi_html = (
 )
 
 st.markdown(kpi_html, unsafe_allow_html=True)
-
 # ============================================================
+# GRÁFICO PASTEL — LOTES POR NIVEL DE SEMAFORIZACIÓN
+# ============================================================
+# ── FUERA de _build_pie_data_v2, función global ──
+def _cat(v):
+    v = float(v)
+    if v <= 0:   return 0
+    elif v <= 1: return 1
+    elif v <= 2: return 2
+    elif v <= 3: return 3
+    else:        return 4
+
+def _build_pie_data_v2(df_full: pd.DataFrame) -> dict:
+    trampas = sorted([t for t in df_full["trampa"].dropna().unique().tolist() if str(t).strip()])
+    semanas  = sorted(df_full["semana"].dropna().unique().astype(int).tolist())
+    por_ts   = {}
+
+    def _contar_lotes_por_cat(sub: pd.DataFrame):
+        cats = [0, 0, 0, 0, 0]
+        if sub.empty:
+            return cats
+        grp = (
+            sub.groupby(["fundo", "modulo", "turno", "lote"], as_index=False)["capturas"]
+            .sum()
+        )
+        for _, row in grp.iterrows():
+            cats[_cat(row["capturas"])] += 1
+        return cats
+
+    por_ts["TODOS"] = {}
+    for s in semanas:
+        sub = df_full[df_full["semana"] == s]
+        por_ts["TODOS"][int(s)] = _contar_lotes_por_cat(sub)
+
+    for t in trampas:
+        por_ts[t] = {}
+        for s in semanas:
+            sub = df_full[(df_full["semana"] == s) & (df_full["trampa"] == t)]
+            por_ts[t][int(s)] = _contar_lotes_por_cat(sub)
+
+    return {"por_ts": por_ts, "trampas": ["TODOS"] + trampas, "semanas": semanas}
+
+
+# ── Datos ──────────────────────────────────────────────────────────────────────
+pie_data = _build_pie_data_v2(df)
+
+SEMAFORO_LABELS = ["0 capturas", "1 captura", "2 capturas", "3 capturas", "> 3 capturas"]
+SEMAFORO_COLORS = ["#a8d5a8", "#22c55e", "#eab308", "#f97316", "#ef4444"]
+
+with st.expander("Lotes por nivel de semaforización", expanded=True):
+
+    col_t, col_a, col_b, col_modo = st.columns([3, 1, 1, 2])
+
+    with col_t:
+        sel_trampa = st.selectbox("Trampa", options=pie_data["trampas"], key="pie_trampa")
+    with col_a:
+        idx_a     = max(0, len(pie_data["semanas"]) - 2)
+        sel_sem_a = st.selectbox("Semana A", options=pie_data["semanas"],
+                                  index=idx_a, key="pie_semA")
+    with col_b:
+        idx_b     = len(pie_data["semanas"]) - 1
+        sel_sem_b = st.selectbox("Semana B", options=pie_data["semanas"],
+                                  index=idx_b, key="pie_semB")
+    with col_modo:
+        modo = st.radio("Modo", options=["Una semana", "Comparar A vs B"],
+                        horizontal=True, key="pie_modo", label_visibility="collapsed")
+
+    comparar = modo == "Comparar A vs B"
+
+    def get_vals(trampa, semana):
+        ts = pie_data["por_ts"].get(trampa, {})
+        return ts.get(int(semana), [0, 0, 0, 0, 0])
+
+    vA   = get_vals(sel_trampa, sel_sem_a)
+    vB   = get_vals(sel_trampa, sel_sem_b)
+    totA = sum(vA)
+    totB = sum(vB)
+    rojA = vA[4]
+    rojB = vB[4]
+
+    # ── KPIs ──
+    if comparar:
+        delta_roj = rojB - rojA
+        k1, k2 = st.columns(2)
+        k1.metric(
+            f"🔴 Rojos sem. {sel_sem_a} → {sel_sem_b}",
+            f"{rojA} → {rojB}",
+            delta=f"{delta_roj:+d} lotes",
+            delta_color="inverse"
+        )
+        k2.metric(
+            "Variación rojos %",
+            f"{(delta_roj/rojA*100):+.1f}%" if rojA > 0 else "N/A",
+        )
+    else:
+        k1, k2 = st.columns(2)
+        k1.metric("🔴 Lotes en rojo (>3)", f"{rojA:,}")
+        k2.metric(
+            "% lotes en rojo",
+            f"{(rojA/totA*100):.1f}%" if totA > 0 else "N/A"
+        )
+
+    # ── Figura Plotly ──
+    def _make_pie(values, name):
+        return go.Pie(
+            labels=SEMAFORO_LABELS,
+            values=values,
+            hole=0.62,
+            marker=dict(colors=SEMAFORO_COLORS, line=dict(color="#ffffff", width=2)),
+            textinfo="value+percent",
+            textposition="outside",
+            outsidetextfont=dict(size=11),
+            hovertemplate="<b>%{label}</b><br>%{value} lotes<br>%{percent}<extra></extra>",
+            sort=False,
+            name=name,
+        )
+
+    if comparar:
+        fig = make_subplots(
+            rows=1, cols=2,
+            specs=[[{"type": "pie"}, {"type": "pie"}]],
+            subplot_titles=[
+                f"Semana {sel_sem_a} · {sel_trampa}",
+                f"Semana {sel_sem_b} · {sel_trampa}",
+            ]
+        )
+        fig.add_trace(_make_pie(vA, f"Sem {sel_sem_a}"), row=1, col=1)
+        fig.add_trace(_make_pie(vB, f"Sem {sel_sem_b}"), row=1, col=2)
+
+        for annotation in fig.layout.annotations:
+            annotation.y = 1.12
+            annotation.font = dict(size=13)
+
+        fig.add_annotation(
+            x=0.20, y=0.5,
+            text=f"<b>{totA}</b><br><span style='font-size:11px'>lotes</span>",
+            showarrow=False, font=dict(size=18, color="#111"),
+            xref="paper", yref="paper"
+        )
+        fig.add_annotation(
+            x=0.80, y=0.5,
+            text=f"<b>{totB}</b><br><span style='font-size:11px'>lotes</span>",
+            showarrow=False, font=dict(size=18, color="#111"),
+            xref="paper", yref="paper"
+        )
+        height = 430
+
+    else:
+        fig = make_subplots(rows=1, cols=1, specs=[[{"type": "pie"}]])
+        fig.add_trace(_make_pie(vA, f"Sem {sel_sem_a}"))
+        fig.add_annotation(
+            x=0.5, y=0.5,
+            text=f"<b>{totA}</b><br><span style='font-size:11px'>lotes</span>",
+            showarrow=False, font=dict(size=20, color="#111"),
+            xref="paper", yref="paper"
+        )
+        height = 460
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=80, r=80, t=50, b=80),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="v",
+            yanchor="middle", y=0.5,
+            xanchor="right",  x=1.18,
+            font=dict(size=12),
+            itemsizing="constant",
+        ),
+        showlegend=True,
+    )
+    st.plotly_chart(fig, use_container_width=True, key="pie_semaforo")
+
+    # ── Tablas comparativas ──
+    if comparar:
+        st.markdown("---")
+
+        def color_dif(val):
+            try:
+                n = int(val.replace("+", ""))
+                if n > 0:   return "color: #dc2626; font-weight:500"
+                elif n < 0: return "color: #16a34a; font-weight:500"
+            except Exception:
+                pass
+            return ""
+
+        # ── Tabla general por nivel ──
+        difs  = [vB[i] - vA[i] for i in range(5)]
+        tabla = {
+            "Nivel":                   SEMAFORO_LABELS,
+            f"Lotes sem. {sel_sem_a}": vA,
+            f"Lotes sem. {sel_sem_b}": vB,
+            "Dif (lotes)":             [f"{d:+}" for d in difs],
+        }
+        df_tabla = pd.DataFrame(tabla)
+        st.dataframe(
+            df_tabla.style.applymap(color_dif, subset=["Dif (lotes)"]),
+            use_container_width=True,
+            hide_index=True,
+            height=213,
+        )
+
+        # ── Tabla por fundo ──
+        def _contar_lotes_por_fundo_cat(sub: pd.DataFrame):
+            if sub.empty:
+                return []
+            grp = (
+                sub.groupby(["fundo", "modulo", "turno", "lote"], as_index=False)["capturas"]
+                .sum()
+            )
+            rows = []
+            for fundo, gdf in grp.groupby("fundo"):
+                cats = [0, 0, 0, 0, 0]
+                for _, row in gdf.iterrows():
+                    cats[_cat(row["capturas"])] += 1
+                for i, label in enumerate(SEMAFORO_LABELS):
+                    rows.append({"Fundo": fundo, "Nivel": label, "lotes": cats[i]})
+            return rows
+
+        df_sem_a = (
+            df[df["semana"] == sel_sem_a]
+            if sel_trampa == "TODOS"
+            else df[(df["semana"] == sel_sem_a) & (df["trampa"] == sel_trampa)]
+        )
+        df_sem_b = (
+            df[df["semana"] == sel_sem_b]
+            if sel_trampa == "TODOS"
+            else df[(df["semana"] == sel_sem_b) & (df["trampa"] == sel_trampa)]
+        )
+
+        rows_fundo_A = _contar_lotes_por_fundo_cat(df_sem_a)
+        rows_fundo_B = _contar_lotes_por_fundo_cat(df_sem_b)
+
+        st.markdown("**Detalle por fundo:**")
+        df_A = pd.DataFrame(rows_fundo_A).rename(columns={"lotes": f"Sem {sel_sem_a}"})
+        df_B = pd.DataFrame(rows_fundo_B).rename(columns={"lotes": f"Sem {sel_sem_b}"})
+
+        df_fundo = pd.merge(df_A, df_B, on=["Fundo", "Nivel"], how="outer").fillna(0)
+        df_fundo[f"Sem {sel_sem_a}"] = df_fundo[f"Sem {sel_sem_a}"].astype(int)
+        df_fundo[f"Sem {sel_sem_b}"] = df_fundo[f"Sem {sel_sem_b}"].astype(int)
+        df_fundo["Dif (lotes)"] = df_fundo.apply(
+            lambda r: f"{r[f'Sem {sel_sem_b}'] - r[f'Sem {sel_sem_a}']:+}", axis=1
+        )
+        nivel_order = {l: i for i, l in enumerate(SEMAFORO_LABELS)}
+        # ── Agregar fila TOTAL por fundo ──
+        totales = []
+        for fundo in df_fundo["Fundo"].unique():
+            sub_f = df_fundo[df_fundo["Fundo"] == fundo]
+            totales.append({
+                "Fundo":              fundo,
+                "Nivel":              "TOTAL",
+                f"Sem {sel_sem_a}":   sub_f[f"Sem {sel_sem_a}"].sum(),
+                f"Sem {sel_sem_b}":   sub_f[f"Sem {sel_sem_b}"].sum(),
+                "Dif (lotes)":        f"{sub_f[f'Sem {sel_sem_b}'].sum() - sub_f[f'Sem {sel_sem_a}'].sum():+}",
+            })
+        df_totales = pd.DataFrame(totales)
+
+        nivel_order = {l: i for i, l in enumerate(SEMAFORO_LABELS)}
+        nivel_order["TOTAL"] = 99  # ← TOTAL va al final de cada fundo
+        df_fundo["_ord"] = df_fundo["Nivel"].map(nivel_order)
+        df_totales["_ord"] = 99
+
+        df_fundo = pd.concat([df_fundo, df_totales], ignore_index=True)
+        df_fundo = df_fundo.sort_values(["Fundo", "_ord"]).drop(columns=["_ord"])
+
+        def color_fundo(row):
+            if row["Nivel"] == "TOTAL":
+                return ["font-weight:bold; background:#f0f0f0"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            df_fundo.style
+                .applymap(color_dif, subset=["Dif (lotes)"])
+                .apply(color_fundo, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+        )
+# ==================================================
 # MAPA CON COMPONENTE JAVASCRIPT
 # ============================================================
 st.markdown("## 🗺️ Mapa Epidemiológico")
