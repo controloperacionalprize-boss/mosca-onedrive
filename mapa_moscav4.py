@@ -1162,8 +1162,10 @@ st.sidebar.markdown("---")
 if not st.session_state.get("incl_peri", False):
     metodo_interp = st.sidebar.radio(
         "🗺️ Método interpolación",
-        options=["GPS (si existe)", "Lotes KMZ", "Híbrido (GPS + KMZ)"],
-        index=1
+    #    options=["GPS (si existe)", "Lotes KMZ", "Híbrido (GPS + KMZ)"],
+         options=["Lotes KMZ"],
+
+        index=0
     )
 else:
     metodo_interp = "GPS (si existe)"
@@ -1742,6 +1744,62 @@ with st.expander("Lotes por nivel de semaforización", expanded=True):
             hide_index=True,
             height=400,
         )
+
+# ============================================================
+# GRÁFICO DE TENDENCIA — LOTES EN ROJO (>3 capturas), POR SEMANA Y FUNDO
+# ============================================================
+def _build_trend_rojo_por_fundo(df_full: pd.DataFrame, trampa_sel: str) -> dict:
+    sub = df_full if trampa_sel == "TODOS" else df_full[df_full["trampa"] == trampa_sel]
+    fundos  = sorted([f for f in sub["fundo"].dropna().unique().tolist() if str(f).strip()])
+    semanas = sorted(sub["semana"].dropna().unique().astype(int).tolist())
+
+    data = {f: {} for f in fundos}
+    for f in fundos:
+        sub_f = sub[sub["fundo"] == f]
+        for s in semanas:
+            sub_fs = sub_f[sub_f["semana"] == s]
+            if sub_fs.empty:
+                data[f][s] = 0
+                continue
+            grp = sub_fs.groupby(["modulo", "turno", "lote"], as_index=False)["capturas"].sum()
+            data[f][s] = int((grp["capturas"].apply(_cat) == 4).sum())
+
+    return {"data": data, "fundos": fundos, "semanas": semanas}
+
+
+with st.expander("📈 Tendencia semanal — Lotes > 3 capturas por fundo", expanded=True):
+
+    trend_data    = _build_trend_rojo_por_fundo(df, sel_trampa)
+    semanas_tend  = trend_data["semanas"]
+    fundos_tend   = trend_data["fundos"]
+
+    fig_trend = go.Figure()
+    for f in fundos_tend:
+        serie_f = [trend_data["data"][f].get(s, 0) for s in semanas_tend]
+        fig_trend.add_trace(go.Scatter(
+            x=semanas_tend,
+            y=serie_f,
+            mode="lines+markers",
+            name=f,
+            marker=dict(size=6),
+            line=dict(width=2.5),
+            hovertemplate=f"<b>{f}</b><br>Semana %{{x}}: %{{y}} lotes<extra></extra>",
+        ))
+
+    fig_trend.update_layout(
+        title=f"Trampa: {sel_trampa}",
+        height=400,
+        margin=dict(l=60, r=30, t=50, b=50),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(title="Semana", dtick=1, gridcolor="rgba(128,128,128,0.15)"),
+        yaxis=dict(title="N° de lotes > 3 capturas", gridcolor="rgba(128,128,128,0.15)"),
+        legend=dict(title="Fundo", orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5),
+        hovermode="x unified",
+    )
+
+    st.plotly_chart(fig_trend, use_container_width=True, key="trend_semaforo")
+
 # ==================================================
 # MAPA CON COMPONENTE JAVASCRIPT
 # ============================================================
