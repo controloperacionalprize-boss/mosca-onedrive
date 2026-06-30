@@ -1660,7 +1660,7 @@ with st.expander("Lotes por nivel de semaforización", expanded=True):
         }
         df_tabla = pd.DataFrame(tabla)
         st.dataframe(
-            df_tabla.style.applymap(color_dif, subset=["Dif (lotes)"]),
+            df_tabla.style.map(color_dif, subset=["Dif (lotes)"]),
             use_container_width=True,
             hide_index=True,
             height=213,
@@ -1736,7 +1736,7 @@ with st.expander("Lotes por nivel de semaforización", expanded=True):
 
         st.dataframe(
             df_fundo.style
-                .applymap(color_dif, subset=["Dif (lotes)"])
+                .map(color_dif, subset=["Dif (lotes)"])
                 .apply(color_fundo, axis=1),
             use_container_width=True,
             hide_index=True,
