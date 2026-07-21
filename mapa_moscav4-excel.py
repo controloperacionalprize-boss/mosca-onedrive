@@ -1100,13 +1100,18 @@ def download_kmz_from_github() -> bytes | None:
         headers["Authorization"] = f"token {token}"
 
 
+    st.sidebar.info(f"🔑 Token KMZ: `{'OK' if token else 'VACÍO'}`")
+    st.sidebar.info(f"🌐 URL: `{api_url}`")
     try:
         req  = urllib.request.Request(api_url, headers=headers)
         resp = urllib.request.urlopen(req, timeout=30)
         data = resp.read()
+        st.sidebar.success(f"✅ KMZ descargado: {len(data)} bytes")
         return data
     except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")[:300]
         st.sidebar.error(f"❌ KMZ HTTP {e.code}: {e.reason}")
+        st.sidebar.code(body)
         return None
     except Exception as ex:
         st.sidebar.error(f"❌ KMZ Error: {ex}")
