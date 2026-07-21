@@ -1,0 +1,2401 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import json
+from datetime import datetime
+import re
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+st.set_page_config(
+    page_title="Mapa Epidemiológico - Mosca de la Fruta",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    .block-container { padding-top: 3rem; }
+    #MainMenu, footer { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# FUNCIONES DE NORMALIZACIÓN (igual que JavaScript)
+# ============================================================
+def norm_mod(val) -> int | None:
+    if not val:
+        return None
+    s = str(val).strip().upper()
+
+    # MOD 01, MOD01, MOD 1, MOD1, MOD 03 → número
+    match = re.search(r'MOD\s*0*(\d+)', s)
+    if match:
+        return int(match.group(1))
+
+    # M01, M02, M10A, M10B (con sufijo letra opcional) → número
+    # Pero NO capturar M01-T3 (eso es turno compuesto)
+    match = re.match(r'^M\s*0*(\d+)[A-Z]?$', s)  # ← añadir [A-Z]?
+    if match:
+        return int(match.group(1))
+
+    # Solo número: "1", "01", "3" → número
+    match = re.match(r'^0*(\d+)$', s)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def norm_tur(val) -> int | None:
+    if not val:
+        return None
+    s = str(val).strip().upper()
+
+    # M1-T6, M2-T10, M01-T3, M03-T2 → número después de T
+    # Cubre formato SENASA con módulo incluido en turno
+    match = re.search(r'M\d+[-\s]T\s*0*(\d+)', s)
+    if match:
+        tur_n = int(match.group(1))
+        return tur_n if tur_n <= 20 else None
+
+    # T08, T01, T10, T03 → número después de T
+    match = re.search(r'\bT\s*0*(\d+)\b', s)
+    if match:
+        tur_n = int(match.group(1))
+        return tur_n if tur_n <= 20 else None
+
+    # Solo número: "6", "06" → número
+    match = re.match(r'^0*(\d+)$', s)
+    if match:
+        n = int(match.group(1))
+        return n if n <= 20 else None
+
+    return None
+
+def norm_lote(val) -> str | None:
+    if not val:
+        return None
+    s = str(val).strip().upper()
+    if not s or s in ('NAN', 'NONE', ''):
+        return None
+    # "1.0" → "1"
+    match = re.match(r'^(\d+)\.0+$', s)
+    if match:
+        return str(int(match.group(1)))
+    # quitar guiones
+    s = s.replace('-', '')
+    # quitar letras sufijo Y ceros adelante: "115B"→"115", "02"→"2", "115-B"→"115"
+    match = re.match(r'^(\d+)[A-Z]*$', s)
+    if match:
+        return str(int(match.group(1)))
+    return s if s else None
+
+def _quitar_tildes(s: str) -> str:
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+def fundo_to_aq(fundo) -> str | None:
+    """Mapear fundo a código AQ"""
+    if not fundo:
+        return None
+    fundo_upper = _quitar_tildes(str(fundo).upper().strip())
+    mapping = {
+        # AQ1
+        'ARENA AZUL':   'AQ1',
+        # AQ2 - Fundo 1: Quri Allpa / Vivadis (mismo lugar, dos nombres)
+        'QURI ALLPA':   'AQ2',
+        'VIVADIS':      'AQ2',
+        # AQ2 - Fundo 2: Kawsay Allpa / Santa Teresa (mismo lugar, dos nombres)
+        'KAWSAY ALLPA': 'AQ2',
+        'SANTA TERESA': 'AQ2',
+        # AQ2 - Fundo 3
+        'AYLLU ALLPA':  'AQ2',
+        'AMPLIACION':'AQ2'
+    }
+    return mapping.get(fundo_upper)
+
+def get_semaforo_category(val: float) -> int:
+    v = float(val)
+    if v <= 0:    return 0  # blanco
+    elif v <= 1:  return 1  # verde
+    elif v <= 2:  return 2  # amarillo
+    elif v <= 3:  return 3  # naranja
+    else:         return 4  # rojo
+
+
+# ============================================================
+# CALCULAR LOTES CON CENTROIDE KMZ (OPCIÓN A)
+# ============================================================
+def calcular_lotes_con_centroide(valid: pd.DataFrame, kmz_polygons: list[dict]) -> list[dict]:
+    # ── Indexar polígonos KMZ por clave normalizada ──
+    poly_index = {}
+    for poly in kmz_polygons:
+        fundo_aq = str(poly.get("fundo_aq", "")).upper().strip()
+        mod_n    = poly.get("mod_n")
+        tur_n    = poly.get("tur_n")
+        lote_n   = norm_lote(str(poly.get("lote_name", "")))
+        if fundo_aq and mod_n and tur_n:
+            key    = f"{fundo_aq}|{mod_n}|{tur_n}|{lote_n}"
+            coords = poly.get("coords", [])
+            if coords:
+                clat = sum(c[0] for c in coords) / len(coords)
+                clon = sum(c[1] for c in coords) / len(coords)
+                poly_index[key] = {
+                    "lat":  clat,
+                    "lon":  clon,
+                    "name": poly.get("name", ""),
+                }
+
+    lotes_markers = []
+    con_kmz_count = 0
+    sin_match     = 0
+
+    for row in valid.to_dict("records"):
+        fundo_aq = fundo_to_aq(str(row.get("fundo", "")))
+        mod_n    = norm_mod(str(row.get("modulo", "")))
+        tur_n    = norm_tur(str(row.get("turno",  "")))
+        lote_n   = norm_lote(str(row.get("lote",  "")))
+        if not fundo_aq or not mod_n or not tur_n:
+            sin_match += 1
+            continue
+
+        key       = f"{fundo_aq}|{mod_n}|{tur_n}|{lote_n}"
+        centroide = poly_index.get(key)
+
+        if centroide:
+            # ── ¿Es trampa perimetral? ──
+            trampa_val = str(row.get("trampa", "")).upper()
+            es_perimetral = "CASERAS PERIMETRALES" in trampa_val
+
+            # ← PEGA EL DEBUG AQUÍ
+            if es_perimetral:
+                poly_match = next(
+                    (p for p in kmz_polygons
+                    if str(p.get("fundo_aq", "")).upper() == fundo_aq
+                    and p.get("mod_n") == mod_n
+                    and p.get("tur_n") == tur_n
+                    and norm_lote(str(p.get("lote_name", ""))) == lote_n),
+                    None
+                )
+                
+                if not poly_match:
+                    disponibles = [
+                        f"{str(p.get('fundo_aq','')).upper()}|{p.get('mod_n')}|{p.get('tur_n')}|{norm_lote(str(p.get('lote_name','')))}"
+                        for p in kmz_polygons
+                        if str(p.get('fundo_aq','')).upper() == fundo_aq
+                        and p.get('mod_n') == mod_n
+                    ]
+                    st.sidebar.write(f"  KMZ para {fundo_aq}|{mod_n}: {disponibles[:5]}")
+
+
+            if es_perimetral:
+                poly_match = next(
+                    (p for p in kmz_polygons
+                    if str(p.get("fundo_aq", "")).upper() == fundo_aq
+                    and p.get("mod_n") == mod_n
+                    and p.get("tur_n") == tur_n
+                    and norm_lote(str(p.get("lote_name", ""))) == lote_n),
+                    None
+                )
+                if poly_match and len(poly_match.get("coords", [])) >= 3:
+                    from shapely.geometry import Polygon as ShapelyPoly, Point
+                    from shapely.ops import nearest_points as shapely_nearest
+                    coords = poly_match["coords"]  # [[lat, lon], ...]
+                    # Shapely usa (lon, lat)
+                    shapely_coords = [(c[1], c[0]) for c in coords]
+                    poly_shp   = ShapelyPoly(shapely_coords)
+                    centroid_pt = Point(centroide["lon"], centroide["lat"])
+                    pt_borde, _ = shapely_nearest(poly_shp.exterior, centroid_pt)
+                    lat_final = pt_borde.y
+                    lon_final = pt_borde.x
+                else:
+                    # Fallback: centroide normal si no encuentra polígono
+                    lat_final = centroide["lat"]
+                    lon_final = centroide["lon"]
+            else:
+                lat_final = centroide["lat"]
+                lon_final = centroide["lon"]
+
+            con_kmz = True
+            con_kmz_count += 1
+        else:
+            lat_excel = row.get("lat")
+            lon_excel = row.get("lon")
+            try:
+                lat_val = float(lat_excel) if lat_excel is not None else None
+                lon_val = float(lon_excel) if lon_excel is not None else None
+            except (ValueError, TypeError):
+                lat_val = None
+                lon_val = None
+
+            if (lat_val is not None and lon_val is not None
+                    and lat_val != -9999.0
+                    and lon_val != -9999.0
+                    and not pd.isna(lat_val)
+                    and not pd.isna(lon_val)):
+                lat_final = lat_val
+                lon_final = lon_val
+                con_kmz   = False
+                sin_match += 1
+            else:
+                sin_match += 1
+                continue
+
+        lotes_markers.append({
+            "lat":      lat_final,
+            "lon":      lon_final,
+            "capturas": float(row.get("capturas", 0)),
+            "fundo":    str(row.get("fundo",  "")),
+            "modulo":   str(row.get("modulo", "")),
+            "turno":    str(row.get("turno",  "")),
+            "lote":     str(row.get("lote",   "")),
+            "trampa":   str(row.get("trampa", "")),
+            "key_kmz":  key,
+            "con_kmz":  con_kmz,
+            "modulo_n": mod_n,   # ← normalizado
+            "turno_n":  tur_n,   # ← normalizado
+            "fundo_aq": fundo_aq, # ← normalizado
+        })
+
+
+    return lotes_markers
+# ============================================================
+# GENERAR CONTORNOS GAUSSIANOS (PYTHON → JS)
+# ============================================================
+def generar_contornos_gauss(
+    lotes:        list[dict],
+    polygons_kmz: list[dict],
+    num_niveles:  int   = 10,
+    grosor_lineas:int   = 3,
+    opacidad_fill:float = 0.65,
+) -> dict:
+    import numpy as np
+    from scipy.ndimage import gaussian_filter
+    from scipy.spatial import cKDTree
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    if len(lotes) < 3:
+        return {"fills": [], "lines": [], "opacidad": opacidad_fill}
+
+    lats = np.array([d["lat"]      for d in lotes])
+    lons = np.array([d["lon"]      for d in lotes])
+    caps = np.array([d["capturas"] for d in lotes], dtype=float)
+
+    # ── Máximo real de capturas (antes de cualquier suavizado) ──
+    z_max_real = float(caps.max()) if len(caps) > 0 else 3.0
+
+    # ── Grilla con bbox de polígonos KMZ ──
+    GRID = 200
+
+    all_poly_lats = []
+    all_poly_lons = []
+    for poly in polygons_kmz:
+        for coord in poly.get("coords", []):
+            all_poly_lats.append(coord[0])
+            all_poly_lons.append(coord[1])
+
+    if all_poly_lats:
+        lat_min = min(all_poly_lats)
+        lat_max = max(all_poly_lats)
+        lon_min = min(all_poly_lons)
+        lon_max = max(all_poly_lons)
+    else:
+        lat_min, lat_max = lats.min(), lats.max()
+        lon_min, lon_max = lons.min(), lons.max()
+
+    dlat = (lat_max - lat_min) * 0.05 or 0.005
+    dlon = (lon_max - lon_min) * 0.05 or 0.005
+    lat_min -= dlat; lat_max += dlat
+    lon_min -= dlon; lon_max += dlon
+
+    grid_lat = np.linspace(lat_min, lat_max, GRID)
+    grid_lon = np.linspace(lon_min, lon_max, GRID)
+    lon_g, lat_g = np.meshgrid(grid_lon, grid_lat)
+
+    # ── Calcular metros por pixel ──
+    lat_range         = lat_max - lat_min
+    lon_range         = lon_max - lon_min
+    metros_por_px_lat = (lat_range * 111000) / GRID
+    metros_por_px_lon = (lon_range * 111000 * np.cos(np.radians(np.mean(lats)))) / GRID
+
+    # ── Calcular sigma en base a distancia al vecino más cercano ──
+    coords_pts  = np.column_stack([lons, lats])
+    tree        = cKDTree(coords_pts)
+    dists_nn, _ = tree.query(coords_pts, k=2)
+    dist_vecino = float(np.median(dists_nn[:, 1]))
+    sigma       = max(0.0005, min(dist_vecino * 0.8, 0.003))
+
+    # ── PROMEDIO PONDERADO LOCAL por punto y vecinos cercanos ──
+    Z_num = np.zeros((GRID, GRID))
+    Z_den = np.zeros((GRID, GRID))
+
+    for la, lo, ca in zip(lats, lons, caps):
+        dx     = lon_g - lo
+        dy     = lat_g - la
+        dist2  = dx**2 + dy**2
+        radio  = (3 * sigma) ** 2
+        dentro = dist2 <= radio
+        peso   = np.where(dentro, np.exp(-dist2 / (2 * sigma**2)), 0.0)
+        Z_num += peso * ca
+        Z_den += peso
+
+    Z = np.where(Z_den > 1e-10, Z_num / Z_den, np.nan)
+
+    # ── Suavizado mínimo ──
+    metros_sigma = 50
+    sigma_lat    = metros_sigma / metros_por_px_lat
+    sigma_lon    = metros_sigma / metros_por_px_lon
+    sigma_px     = max(0.3, min((sigma_lat + sigma_lon) / 2, 1.5))
+
+    Z_temp     = np.where(np.isnan(Z), 0.0, Z)
+    Z_temp     = gaussian_filter(Z_temp, sigma=sigma_px)
+    Z_den_temp = np.where(np.isnan(Z), 0.0, 1.0)
+    Z_den_temp = gaussian_filter(Z_den_temp, sigma=sigma_px)
+    Z          = np.where(Z_den_temp > 0.01, Z_temp / Z_den_temp, np.nan)
+
+    # ── Recortar con Shapely ──
+    mask = np.zeros((GRID, GRID), dtype=bool)
+    if polygons_kmz:
+        try:
+            from shapely.geometry import Polygon as ShapelyPolygon, Point
+            from shapely.ops import unary_union
+            from shapely.prepared import prep
+
+            shapes = []
+            for poly in polygons_kmz:
+                coords = poly.get("coords", [])
+                if len(coords) >= 3:
+                    shapely_coords = [(c[1], c[0]) for c in coords]
+                    try:
+                        shp = ShapelyPolygon(shapely_coords)
+                        if not shp.is_valid:
+                            shp = shp.buffer(0)
+                        if shp.is_valid and not shp.is_empty:
+                            shapes.append(shp)
+                    except Exception:
+                        pass
+
+            if shapes:
+                union          = unary_union(shapes)
+                union_mask     = union.buffer(0.0001)
+                prepared_union = prep(union_mask)
+                flat_lons      = lon_g.ravel()
+                flat_lats      = lat_g.ravel()
+                inside = np.array([
+                    prepared_union.contains(Point(flon, flat))
+                    for flon, flat in zip(flat_lons, flat_lats)
+                ])
+                mask = inside.reshape(GRID, GRID)
+            else:
+                mask[:] = True
+
+        except ImportError:
+            mask[:] = True
+    else:
+        mask[:] = True
+
+    # ── Aplicar máscara ──
+    Z_masked = np.where(mask, Z, np.nan)
+
+    z_valid = Z_masked[~np.isnan(Z_masked)]
+    if len(z_valid) == 0:
+        return {"fills": [], "lines": [], "opacidad": opacidad_fill}
+
+    z_max_grilla = float(z_valid.max())
+
+    # ── REESCALAR: el pico de la grilla debe igualar el máximo real de capturas ──
+    # El gaussiano diluye los picos (ej: 3 capturas → grilla llega a 1.8)
+    # Reescalamos proporcionalmente para que el pico vuelva al valor real
+    if z_max_grilla > 0:
+        Z_masked = Z_masked * (z_max_real / z_max_grilla)
+
+    z_valid = Z_masked[~np.isnan(Z_masked)]
+    z_min   = float(z_valid.min())
+
+    # ── Semáforo fijo: verde=0, amarillo=1, naranja=2, rojo=3+ ──
+    vmin = 0
+    vmax = max(4.0, z_max_real)
+    colors_semaforo = [
+    (0 / vmax, "#90EE90"),  # verde tenue → 0
+    (1 / vmax, "#00FF00"),  # verde       → 1
+    (2 / vmax, "#FFFF00"),  # amarillo    → 2
+    (3 / vmax, "#FFA500"),  # naranja     → 3
+    (4 / vmax, "#FF0000"),  # rojo        → >3
+    (1.0,      "#FF0000"),
+]
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "semaforo", colors_semaforo, N=256
+    )
+
+    # ── Líneas de contour en valores enteros del semáforo ──
+    levels_lines_base = [l for l in [1, 2, 3, 4] if z_min < l < z_max_real]
+
+    if num_niveles > 3:
+        extra = np.linspace(z_min, z_max_real, num_niveles + 1)[1:-1]
+        levels_lines_extra = [
+            float(l) for l in extra
+            if l not in levels_lines_base
+            and z_min < l < z_max_real
+        ]
+        levels_lines = sorted(set(levels_lines_base + levels_lines_extra))
+    else:
+        levels_lines = levels_lines_base
+
+    fig, ax = plt.subplots()
+
+    N_bands     = 256
+    levels_cont = np.linspace(vmin, vmax, N_bands)
+
+    cf = ax.contourf(
+        lon_g, lat_g, Z_masked,
+        levels=levels_cont,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax
+    )
+
+    cl = None
+    if levels_lines:
+        cl = ax.contour(
+            lon_g, lat_g, Z_masked,
+            levels=levels_lines,
+            colors="black",
+            linewidths=grosor_lineas
+        )
+
+    # ── Serializar rellenos ──
+    fills = []
+    for i in range(len(cf.allsegs)):
+        level_val = levels_cont[i] if i < len(levels_cont) else 0
+        rgba      = cmap((level_val - vmin) / max(vmax - vmin, 1))
+        color_hex = mcolors.to_hex(rgba)
+        segs      = cf.allsegs[i]
+        for seg in segs:
+            if len(seg) < 3:
+                continue
+            latlons = [[float(p[1]), float(p[0])] for p in seg]
+            fills.append({"color": color_hex, "coords": latlons})
+
+    # ── Serializar líneas ──
+    lines = []
+    if cl is not None:
+        for i, level in enumerate(levels_lines):
+            segs = cl.allsegs[i] if i < len(cl.allsegs) else []
+            for seg in segs:
+                if len(seg) < 2:
+                    continue
+                latlons = [[float(p[1]), float(p[0])] for p in seg]
+                lines.append({
+                    "level":  float(level),
+                    "coords": latlons,
+                    "grosor": grosor_lineas,
+                })
+
+    plt.close(fig)
+    return {
+        "fills":    fills,
+        "lines":    lines,
+        "opacidad": opacidad_fill,
+    }
+# ============================================================
+# CARGAR KMZ LOCAL (MEJORADO - 4 NIVELES)
+# ============================================================
+@st.cache_data(show_spinner="Cargando polígonos KMZ…")
+def load_kmz_local(kmz_path: str = "data/MODULOS_PRIZE_PAIJAN.kmz"):
+    """
+    Carga KMZ local y parsea polígonos con 4 niveles:
+    FUNDO_AQ, MÓDULO, TURNO, LOTE
+    Con DEBUG detallado para troubleshooting
+    """
+    import zipfile
+    from pathlib import Path
+    try:
+        kmz_file = Path(kmz_path)
+        if not kmz_file.exists():
+            st.error(f"❌ KMZ no encontrado en:\n`{kmz_file.absolute()}`")
+            st.info("💡 Verifica la ruta. Debes usar la ruta correcta del archivo KMZ.")
+            return []
+
+        with zipfile.ZipFile(kmz_file, 'r') as kmz:
+            kml_files = [f for f in kmz.namelist() if f.lower().endswith('.kml')]
+            if not kml_files:
+                st.error("❌ No se encontró archivo .kml dentro del KMZ")
+                st.info(f"📁 Archivos en el KMZ: {kmz.namelist()}")
+                return []
+
+
+            kml_content = kmz.read(kml_files[0])
+
+            try:
+                from lxml import etree
+                parser = etree.XMLParser(recover=True, encoding='utf-8')
+                root   = etree.fromstring(kml_content, parser=parser)
+
+                nsmap = {
+                    'kml': 'http://www.opengis.net/kml/2.2',
+                    'gx':  'http://www.google.com/kml/ext/2.2'
+                }
+
+                polygons = []
+                skipped  = {"sin_coords": 0, "sin_mod": 0, "sin_tur": 0, "total": 0}
+
+                # ── BUSCAR CARPETAS DE MÓDULOS (IGNORAR POZOS) ──
+                folders = root.xpath('.//kml:Folder', namespaces=nsmap)
+                if not folders:
+                    folders = root.xpath('.//*[local-name()="Folder"]')
+
+
+                folder_names = []
+                for folder in folders:
+                    folder_name_xpath = folder.xpath('.//kml:name/text()', namespaces=nsmap)
+                    if not folder_name_xpath:
+                        folder_name_xpath = folder.xpath('.//*[local-name()="name"]/text()')
+                    if folder_name_xpath:
+                        folder_names.append(folder_name_xpath[0])
+
+
+                target_folders = []
+                for folder in folders:
+                    folder_name_xpath = folder.xpath('.//kml:name/text()', namespaces=nsmap)
+                    if not folder_name_xpath:
+                        folder_name_xpath = folder.xpath('.//*[local-name()="name"]/text()')
+
+                    if folder_name_xpath:
+                        fname = folder_name_xpath[0].upper()
+                        if ('AQ1' in fname or 'AQ2' in fname) and 'MODULO' in fname:
+                            target_folders.append((folder, folder_name_xpath[0]))
+
+                if not target_folders:
+                    st.error("❌ No se encontraron carpetas 'AQ1 - MODULO' o 'AQ2 - MODULO'")
+                    st.info("💡 Ignorando carpeta 'Pozos_Prize' (son pozos, no lotes)")
+                    return []
+
+                placemarks = []
+                for target_folder, folder_name in target_folders:
+                    folder_placemarks = target_folder.xpath('.//kml:Placemark', namespaces=nsmap)
+                    if not folder_placemarks:
+                        folder_placemarks = target_folder.xpath('.//*[local-name()="Placemark"]')
+                    for pm in folder_placemarks:
+                        placemarks.append((pm, folder_name))
+
+
+                for idx, (pm, folder_name) in enumerate(placemarks[:3]):
+                    name_el = pm.xpath('.//kml:name/text()', namespaces=nsmap)
+                    if not name_el:
+                        name_el = pm.xpath('.//*[local-name()="name"]/text()')
+                    name_text = name_el[0] if name_el else "(sin nombre)"
+
+                for idx, (placemark, folder_name) in enumerate(placemarks):
+                    skipped["total"] += 1
+
+                    # ── EXTRAER NOMBRE ──
+                    name_xpath = placemark.xpath('.//kml:name/text()', namespaces=nsmap)
+                    if not name_xpath:
+                        name_xpath = placemark.xpath('.//*[local-name()="name"]/text()')
+                    name = name_xpath[0].strip() if name_xpath else ""
+
+                    # ── EXTRAER DESCRIPCIÓN ──
+                    desc_xpath = placemark.xpath('.//kml:description/text()', namespaces=nsmap)
+                    if not desc_xpath:
+                        desc_xpath = placemark.xpath('.//*[local-name()="description"]/text()')
+                    desc = desc_xpath[0].strip() if desc_xpath else ""
+
+                    # ── EXTRAER FUNDO_AQ Y MOD_N DEL NOMBRE DE CARPETA ──
+                    fundo_aq = None
+                    mod_n    = None
+
+                    fundo_match = re.search(r'(AQ\d+)', folder_name, re.IGNORECASE)
+                    if fundo_match:
+                        fundo_aq = fundo_match.group(1).upper()
+
+                    mod_match = re.search(r'MODULO\s*0*(\d+)', folder_name, re.IGNORECASE)
+                    if mod_match:
+                        mod_n = int(mod_match.group(1))
+
+                    if not fundo_aq or not mod_n:
+                        skipped["sin_mod"] += 1
+                        continue
+
+                    if idx < 3 and desc:
+                        desc_preview = desc[:500] if len(desc) > 500 else desc
+
+                    # ── EXTRAER COORDENADAS ──
+                    coords = []
+
+                    coord_xpath = placemark.xpath('.//kml:Polygon//kml:coordinates/text()', namespaces=nsmap)
+                    if not coord_xpath:
+                        coord_xpath = placemark.xpath('.//*[local-name()="Polygon"]//*[local-name()="coordinates"]/text()')
+                    if not coord_xpath:
+                        coord_xpath = placemark.xpath('.//kml:LineString//kml:coordinates/text()', namespaces=nsmap)
+                    if not coord_xpath:
+                        coord_xpath = placemark.xpath('.//*[local-name()="LineString"]//*[local-name()="coordinates"]/text()')
+                    if not coord_xpath:
+                        coord_xpath = placemark.xpath('.//kml:Point//kml:coordinates/text()', namespaces=nsmap)
+                    if not coord_xpath:
+                        coord_xpath = placemark.xpath('.//*[local-name()="Point"]//*[local-name()="coordinates"]/text()')
+                    if not coord_xpath:
+                        coord_xpath = placemark.xpath('.//*[local-name()="coordinates"]/text()')
+
+                    if coord_xpath:
+                        coord_text = coord_xpath[0].strip()
+                        for coord_tuple in coord_text.split():
+                            if coord_tuple.strip():
+                                parts = coord_tuple.split(',')
+                                if len(parts) >= 2:
+                                    try:
+                                        lon, lat = float(parts[0]), float(parts[1])
+                                        coords.append([lat, lon])
+                                    except (ValueError, IndexError):
+                                        pass
+
+                    is_point = False
+                    if len(coords) == 1:
+                        is_point = True
+                    elif len(coords) < 3:
+                        skipped["sin_coords"] += 1
+                        continue
+
+                    # ── EXTRAER TURNO ──
+                    tur_n = None
+
+                    tur_desc_match = re.search(
+                        r'<td[^>]*>\s*Turno\s*</td>\s*<td[^>]*>\s*(\d+)',
+                        desc, re.IGNORECASE
+                    )
+                    if tur_desc_match:
+                        tur_n = int(tur_desc_match.group(1))
+
+                    if tur_n is None:
+                        tur_match = re.search(r'[Tt]urno[:\s]*(\d+)', desc)
+                        if tur_match:
+                            tur_n = int(tur_match.group(1))
+
+                    if tur_n is None:
+                        tur_match = re.search(r'T[\s\-]?(\d+)', name, re.IGNORECASE)
+                        if tur_match:
+                            tur_n = int(tur_match.group(1))
+
+                    if tur_n is None:
+                        tur_n = 1
+
+                    if tur_n > 20:
+                        skipped["sin_tur"] += 1
+                        continue
+
+                    # ── EXTRAER LOTE ──
+                    lote = None
+
+                    lote_desc_match = re.search(
+                        r'<td[^>]*>\s*Lote\s*</td>\s*<td[^>]*>\s*(\d+)',
+                        desc, re.IGNORECASE
+                    )
+                    if lote_desc_match:
+                        lote = norm_lote(lote_desc_match.group(1))
+
+                    if not lote:
+                        lote_match = re.search(r'[Ll]ote[:\s]*(\d+)', desc)
+                        if lote_match:
+                            lote = norm_lote(lote_match.group(1))
+
+                    if not lote:
+                        lote_match = re.search(r'(?:LOTE|LOT)[:\s]*([^\s,;<]+)', name, re.IGNORECASE)
+                        if lote_match:
+                            lote = norm_lote(lote_match.group(1))
+
+                    if not lote:
+                        lote = f"PZ_{name.replace(' ', '_').strip()}"
+                    lote_n_debug = norm_lote(str(lote))
+                    # ── AGREGAR POLÍGONO VÁLIDO ──
+                    polygons.append({
+                        "name":      name or f"Polígono {len(polygons)+1}",
+                        "coords":    coords,
+                        "mod_n":     mod_n,
+                        "tur_n":     tur_n,
+                        "fundo_aq":  fundo_aq,
+                        "lote":      lote,
+                        "lote_name": lote,
+                    })
+
+                if polygons:
+                    return polygons
+                else:
+                    st.error("❌ No se encontraron polígonos válidos")
+                    st.error(
+                        f"📊 Rechazo: Sin coords: {skipped['sin_coords']}, "
+                        f"Sin mod: {skipped['sin_mod']}, Sin tur: {skipped['sin_tur']}"
+                    )
+                    return []
+
+            except ImportError:
+                st.error("❌ lxml no instalado. Instala con: `pip install lxml`")
+                return []
+
+    except Exception as e:
+        st.error(f"❌ Error cargando KMZ: {e}")
+        import traceback
+        st.error(f"📋 Traceback:\n```\n{traceback.format_exc()}\n```")
+        return []
+
+@st.cache_data(show_spinner="Cargando puntos GPS de trampas…")
+def load_kmz_puntos(kmz_bytes_dict: dict) -> dict:
+    """
+    Carga 4 KMZ de puntos de trampas y retorna un índice:
+    { norm_lote: {"lat": float, "lon": float, "fundo_aq": str} }
+    
+    kmz_bytes_dict: { "AQ1": bytes, "AA": bytes, "VV": bytes, "ST": bytes }
+    """
+    import zipfile, re
+    from lxml import etree
+
+    # ── Mapeo de prefijo KMZ → fundo_aq ──
+    PREFIJO_MAP = {
+        "AQ1": "AQ1",  # Arena Azul
+        "AQ":  "AQ1",  # Arena Azul variante
+        "AA":  "AQ2",  # Ayllu Allpa
+        "VV":  "AQ2",  # Vivadis
+        "ST":  "AQ2",  # Santa Teresa
+    }
+
+    def extraer_lote_de_nombre(name: str) -> str | None:
+        """
+        Extrae el lote normalizado del nombre del placemark:
+        PT_ST_240      → "240"
+        PT_AA_115B     → "115"
+        PT_AA_113      → "113"
+        PT_AQ_ML_T2L34 → "34"
+        PT_AQ1_JT_T10_Lt86 → "86"
+        PT_VV-27       → "27"
+        """
+        n = name.strip().upper()
+
+        # PT_AQ1_JT_T{n}_Lt{lote} → lote después de Lt
+        m = re.search(r'LT(\d+)', n)
+        if m:
+            return str(int(m.group(1)))
+
+        # PT_AQ_ML_T{n}L{lote} → lote después de L (pero no LT)
+        m = re.search(r'T\d+L(\d+)', n)
+        if m:
+            return str(int(m.group(1)))
+
+        # PT_VV-{lote} → número después de guion
+        m = re.search(r'VV[-_](\d+)', n)
+        if m:
+            return str(int(m.group(1)))
+
+        # PT_ST_{lote} → número al final
+        m = re.search(r'ST[-_](\d+)', n)
+        if m:
+            return str(int(m.group(1)))
+
+        # PT_AA_{lote} → alfanumérico al final (115B → 115, 113 → 113)
+        m = re.search(r'AA[-_](\d+)', n)
+        if m:
+            return str(int(m.group(1)))
+
+        # Fallback: último número en el nombre
+        nums = re.findall(r'\d+', n)
+        if nums:
+            return str(int(nums[-1]))
+
+        return None
+
+    def extraer_fundo_aq_de_nombre(name: str) -> str | None:
+        n = name.strip().upper()
+        if "AQ1" in n or re.search(r'PT_AQ', n):
+            return "AQ1"
+        if "AA" in n:
+            return "AQ2"
+        if "VV" in n:
+            return "AQ2"
+        if "ST" in n:
+            return "AQ2"
+        return None
+
+    puntos_index = {}  # { "AQ1|115": {"lat":..., "lon":...} }
+    total = 0
+    ok    = 0
+
+    for kmz_key, kmz_bytes in kmz_bytes_dict.items():
+        if not kmz_bytes:
+            continue
+        try:
+            import io
+            with zipfile.ZipFile(io.BytesIO(kmz_bytes), 'r') as kmz:
+                kml_files = [f for f in kmz.namelist() if f.lower().endswith('.kml')]
+                if not kml_files:
+                    continue
+                kml_content = kmz.read(kml_files[0])
+
+            parser = etree.XMLParser(recover=True, encoding='utf-8')
+            root   = etree.fromstring(kml_content, parser=parser)
+
+            placemarks = root.xpath('.//*[local-name()="Placemark"]')
+
+            for pm in placemarks:
+                total += 1
+
+                # ── Nombre ──
+                name_el = pm.xpath('.//*[local-name()="name"]/text()')
+                name    = name_el[0].strip() if name_el else ""
+                if not name:
+                    continue
+
+                # ── Coordenadas (solo Point) ──
+                coord_el = pm.xpath('.//*[local-name()="Point"]//*[local-name()="coordinates"]/text()')
+                if not coord_el:
+                    continue
+                parts = coord_el[0].strip().split(',')
+                if len(parts) < 2:
+                    continue
+                try:
+                    lon = float(parts[0])
+                    lat = float(parts[1])
+                except ValueError:
+                    continue
+
+                # ── Extraer lote y fundo_aq ──
+                lote_n   = extraer_lote_de_nombre(name)
+                fundo_aq = extraer_fundo_aq_de_nombre(name)
+
+                if not lote_n or not fundo_aq:
+                    continue
+
+                key = f"{fundo_aq}|{lote_n}"
+                puntos_index[key] = {"lat": lat, "lon": lon, "name": name}
+                ok += 1
+
+        except Exception:
+            continue
+
+    return puntos_index
+# ============================================================
+# CARGAR DATOS EXCEL
+# ============================================================
+
+# ============================================================
+# CARGAR DATOS DESDE SHAREPOINT (MSAL device flow → Graph API)
+# ============================================================
+import msal, urllib.request, urllib.parse, json as _json
+
+# App pública de Microsoft Office — no requiere registro propio,
+# funciona con cualquier cuenta M365 incluyendo MFA.
+_MSAL_CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+_MSAL_AUTHORITY = "https://login.microsoftonline.com/common"
+_MSAL_SCOPES    = ["https://graph.microsoft.com/Files.Read.All"]
+
+# Ruta SharePoint expresada como Drive path de Graph API
+# "Documentos compartidos" es el nombre del drive, NO una subcarpeta
+_SP_HOST       = "aquanqape.sharepoint.com"
+_SP_SITE_PATH  = "/sites/OficinasPrizePeru"
+_SP_FOLDER     = "PowerBI Global/02.-BI-Administracion Agricola/Fitosanidad/Mosca_Fruta"
+
+RENAME_MAP = {
+    "FUNDO": "fundo", "FECHA": "fecha", "TRAMPA": "trampa",
+    "MES": "mes", "AÑO": "anio", "SEMANA": "semana",
+    "MODULO": "modulo", "TURNO": "turno", "LOTE": "lote",
+    "TIPO DE TRAMPA": "tipo_trampa", "CAPTURAS": "capturas",
+    "N° TRAMPAS": "n_trampas", "MTD": "mtd",
+}
+
+
+def _df_vacio_con_columnas() -> pd.DataFrame:
+    cols = [
+        "fundo", "fecha", "trampa", "mes", "anio", "semana",
+        "modulo", "turno", "lote", "tipo_trampa", "capturas",
+        "n_trampas", "mtd", "lat", "lon",
+    ]
+    return pd.DataFrame(columns=cols)
+
+
+@st.cache_resource
+def _get_msal_app():
+    return msal.PublicClientApplication(
+        client_id=_MSAL_CLIENT_ID,
+        authority=_MSAL_AUTHORITY,
+    )
+
+
+def _get_graph_token() -> str | None:
+    app = _get_msal_app()
+    accounts = app.get_accounts()
+    result = app.acquire_token_silent(_MSAL_SCOPES, account=accounts[0]) if accounts else None
+    if result and "access_token" in result:
+        return result["access_token"]
+
+    flow = app.initiate_device_flow(scopes=_MSAL_SCOPES)
+    st.warning(
+        f"**Autenticación requerida** — "
+        f"Ve a [microsoft.com/devicelogin](https://microsoft.com/devicelogin) "
+        f"e ingresa el código: **`{flow['user_code']}`**"
+    )
+    with st.spinner("Esperando autenticación..."):
+        result = app.acquire_token_by_device_flow(flow)
+
+    if "access_token" not in result:
+        st.error(f"❌ Error de autenticación: {result.get('error_description', result)}")
+        return None
+    return result["access_token"]
+
+
+def _graph_get(url: str, token: str) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return _json.loads(resp.read())
+
+
+def _graph_download(url: str, token: str) -> bytes:
+    # Graph devuelve 302 → URL real del archivo; urllib sigue el redirect
+    # pero el segundo request ya no necesita el token de Auth
+    import urllib.error
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+    with opener.open(req, timeout=120) as resp:
+        return resp.read()
+
+
+@st.cache_data(show_spinner="Descargando Excel desde SharePoint…", ttl=300)
+def _descargar_excels_sharepoint(token: str) -> list[bytes]:
+    # 1. Obtener el ID del site
+    site_url = (
+        f"https://graph.microsoft.com/v1.0/sites/"
+        f"{_SP_HOST}:{_SP_SITE_PATH}"
+    )
+    try:
+        site = _graph_get(site_url, token)
+        site_id = site["id"]
+    except Exception as e:
+        st.error(f"❌ No se pudo acceder al sitio SharePoint: {e}")
+        return []
+
+    # 2. Listar drives y mostrarlos para diagnosticar
+    drives_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
+    try:
+        drives = _graph_get(drives_url, token)
+        drive = next(
+            (d for d in drives["value"]
+             if "documento" in d["name"].lower() or "document" in d["name"].lower()),
+            drives["value"][0],
+        )
+        drive_id = drive["id"]
+    except Exception as e:
+        st.error(f"❌ No se pudo obtener el drive: {e}")
+        return []
+
+    # 3. Listar archivos de la carpeta
+    folder_enc = urllib.parse.quote(_SP_FOLDER)
+    items_url  = (
+        f"https://graph.microsoft.com/v1.0/drives/{drive_id}"
+        f"/root:/{folder_enc}:/children"
+        f"?$select=name,file,@microsoft.graph.downloadUrl"
+    )
+    try:
+        items = _graph_get(items_url, token)
+        archivos = [
+            i for i in items.get("value", [])
+            if i.get("file") and i["name"].endswith(".xlsx")
+        ]
+    except Exception as e:
+        st.error(f"❌ Error listando carpeta SharePoint: {e}")
+        return []
+
+    if not archivos:
+        st.error("❌ No se encontraron archivos .xlsx en la carpeta.")
+        return []
+
+    # 4. Descargar cada xlsx usando el endpoint /content de Graph
+    excels = []
+    for arch in archivos:
+        nombre_enc = urllib.parse.quote(f"{_SP_FOLDER}/{arch['name']}")
+        dl_url = (
+            f"https://graph.microsoft.com/v1.0/drives/{drive_id}"
+            f"/root:/{nombre_enc}:/content"
+        )
+        try:
+            excels.append(_graph_download(dl_url, token))
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ No se pudo descargar {arch['name']}: {e}")
+
+    return excels
+
+
+def load_trampas_anexadas() -> pd.DataFrame:
+    token = _get_graph_token()
+    if not token:
+        return _df_vacio_con_columnas()
+
+    excels_bytes = _descargar_excels_sharepoint(token)
+    if not excels_bytes:
+        return _df_vacio_con_columnas()
+
+    import io
+    partes = []
+    for b in excels_bytes:
+        try:
+            partes.append(pd.read_excel(io.BytesIO(b)))
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Error leyendo Excel: {e}")
+
+    if not partes:
+        return _df_vacio_con_columnas()
+
+    df = pd.concat(partes, ignore_index=True)
+    df = df.rename(columns={k: v for k, v in RENAME_MAP.items() if k in df.columns})
+    df["capturas"]  = pd.to_numeric(df.get("capturas"),  errors="coerce").fillna(0).astype(int)
+    df["anio"]      = pd.to_numeric(df.get("anio"),      errors="coerce").astype("Int64")
+    df["semana"]    = pd.to_numeric(df.get("semana"),     errors="coerce").astype("Int64")
+    df["n_trampas"] = pd.to_numeric(df.get("n_trampas"), errors="coerce")
+    df["mtd"]       = pd.to_numeric(df.get("mtd"),        errors="coerce")
+    df["fecha"]     = pd.to_datetime(df.get("fecha"),     errors="coerce").dt.date
+    for col in ["fundo", "modulo", "turno", "trampa", "lote", "tipo_trampa", "mes"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    # Normalizar tildes en fundo para evitar duplicados (ej: AMPLIACION vs AMPLIACIÓN)
+    if "fundo" in df.columns:
+        df["fundo"] = df["fundo"].apply(lambda x: _quitar_tildes(str(x).upper()) if pd.notna(x) else x)
+    df["lat"] = float("nan")
+    df["lon"]  = float("nan")
+    df = df[df["anio"] == 2026].copy()
+    return df
+# ============================================================
+# SIDEBAR - FILTROS COMPLETOS
+# ============================================================
+st.sidebar.header("⚙️ Configuración")
+
+if st.sidebar.button("🔄 Limpiar todos los filtros", use_container_width=True):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+st.sidebar.markdown("---")
+
+# ============================================================
+# CARGAR DATOS EXCEL Y KMZ
+# ============================================================
+df = load_trampas_anexadas()
+@st.cache_data(show_spinner="Descargando KMZ desde GitHub…")
+def download_kmz_from_github() -> bytes | None:
+    import urllib.request, urllib.error
+    token   = st.secrets.get("GITHUB_TOKEN_KMZ", "")
+    api_url = (
+        "https://api.github.com/repos/"
+        "controloperacionalprize-boss/CAMPO_RENDIMIENTO/"
+        "contents/MODULOS_PRIZE_PAIJAN.kmz"
+    )
+    headers = {"Accept": "application/vnd.github.v3.raw"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+
+    try:
+        req  = urllib.request.Request(api_url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = resp.read()
+        return data
+    except urllib.error.HTTPError as e:
+        st.sidebar.error(f"❌ KMZ HTTP {e.code}: {e.reason}")
+        return None
+    except Exception as ex:
+        st.sidebar.error(f"❌ KMZ Error: {ex}")
+        return None
+
+# ── Cargar KMZ: primero GitHub, fallback local ──
+_kmz_bytes = download_kmz_from_github()
+
+if _kmz_bytes:
+    import tempfile, os
+    _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kmz")
+    _tmp.write(_kmz_bytes)
+    _tmp.close()
+    kmz_polygons = load_kmz_local(_tmp.name)
+    os.unlink(_tmp.name)
+else:
+    st.sidebar.error("❌ KMZ no disponible")
+    kmz_polygons = []
+
+# ── FILTROS ENCADENADOS ──
+with st.sidebar.expander("🔍 Filtros de datos", expanded=True):
+
+    df_f = df.copy()
+
+    # ── SEMANA ──
+    semanas_opts = ["Todos"] + sorted(df_f["semana"].dropna().unique().astype(int).tolist())
+    sel_semana_val = st.selectbox("Semana", options=semanas_opts, index=0)
+    sel_semana = [] if sel_semana_val == "Todos" else [int(sel_semana_val)]
+    df_f = df_f[df_f["semana"] == int(sel_semana_val)].copy() if sel_semana else df_f
+
+    # ── FUNDO ──
+    fundos_opts = ["Todos"] + sorted(df_f["fundo"].dropna().unique().tolist())
+    sel_fundo_val = st.selectbox("Fundo", options=fundos_opts, index=0)
+    sel_fundo = [] if sel_fundo_val == "Todos" else [sel_fundo_val]
+    df_f = df_f[df_f["fundo"] == sel_fundo_val].copy() if sel_fundo else df_f
+
+    # ── MÓDULO ──
+    mods_opts = ["Todos"] + sorted(df_f["modulo"].dropna().unique().tolist())
+    sel_mod_val = st.selectbox("Módulo", options=mods_opts, index=0)
+    sel_mod = [] if sel_mod_val == "Todos" else [sel_mod_val]
+    df_f = df_f[df_f["modulo"] == sel_mod_val].copy() if sel_mod else df_f
+
+    # ── LOTE ──
+    lotes_opts = ["Todos"] + (sorted(df_f["lote"].dropna().unique().tolist()) if "lote" in df_f.columns else [])
+    sel_lote_val = st.selectbox("Lote", options=lotes_opts, index=0)
+    sel_lote = [] if sel_lote_val == "Todos" else [sel_lote_val]
+    df_f = df_f[df_f["lote"] == sel_lote_val].copy() if sel_lote else df_f
+
+    # ── TURNO ──
+    turnos_opts = ["Todos"] + sorted(df_f["turno"].dropna().unique().tolist())
+    sel_turno_val = st.selectbox("Turno", options=turnos_opts, index=0)
+    sel_turno = [] if sel_turno_val == "Todos" else [sel_turno_val]
+    df_f = df_f[df_f["turno"] == sel_turno_val].copy() if sel_turno else df_f
+
+    # ── TRAMPA ──
+    trampas_sin_peri = sorted([
+        t for t in df_f["trampa"].dropna().unique().tolist()
+        if "CASERAS PERIMETRALES" not in t.upper()
+    ])
+    trampas_opts = ["Todos"] + trampas_sin_peri
+
+    incluir_peri = st.checkbox("Ver solo Caseras Perimetrales", value=False, key="incl_peri")
+
+    if incluir_peri:
+        # Solo perimetrales, ocultar selectbox
+        df_f = df_f[df_f["trampa"].str.upper().str.contains("CASERAS PERIMETRALES", na=False)].copy()
+        sel_trampa_val = "CASERAS PERIMETRALES"
+        sel_trampa     = [sel_trampa_val]
+    else:
+        sel_trampa_val = st.selectbox("Trampa", options=trampas_opts, index=0, key="sel_trampa")
+        sel_trampa     = [] if sel_trampa_val == "Todos" else [sel_trampa_val]
+        df_f = (
+            df_f[df_f["trampa"].isin(trampas_sin_peri)].copy()
+            if sel_trampa_val == "Todos"
+            else df_f[df_f["trampa"] == sel_trampa_val].copy()
+        )
+
+    # ── RANGO DE FECHAS ──
+    if "fecha" in df_f.columns and not df_f.empty:
+        min_f = df_f["fecha"].min()
+        max_f = df_f["fecha"].max()
+        sel_fecha = st.date_input(
+            "Rango de fechas", value=(min_f, max_f),
+            min_value=min_f, max_value=max_f
+        )
+        f_ini, f_fin = (
+            (sel_fecha[0], sel_fecha[1])
+            if isinstance(sel_fecha, tuple)
+            else (sel_fecha, sel_fecha)
+        )
+        dff = df_f[(df_f["fecha"] >= f_ini) & (df_f["fecha"] <= f_fin)].copy()
+    else:
+        dff = df_f.copy()
+
+# ── FILTRO SEMAFORIZACIÓN ──
+st.sidebar.markdown("**Filtro por semaforización:**")
+sel_sem_blanco   = st.sidebar.checkbox("⚪ 0 capturas",   value=True, key="sem_blanco")
+sel_sem_verde    = st.sidebar.checkbox("🟢 1 captura",    value=True, key="sem_verde")
+sel_sem_amarillo = st.sidebar.checkbox("🟡 2 capturas",   value=True, key="sem_amarillo")
+sel_sem_naranja  = st.sidebar.checkbox("🟠 3 capturas",   value=True, key="sem_naranja")
+sel_sem_rojo_f   = st.sidebar.checkbox("🔴 > 3 capturas", value=True, key="sem_rojo")
+
+cats_permitidas = set()
+if sel_sem_blanco:   cats_permitidas.add(0)
+if sel_sem_verde:    cats_permitidas.add(1)
+if sel_sem_amarillo: cats_permitidas.add(2)
+if sel_sem_naranja:  cats_permitidas.add(3)
+if sel_sem_rojo_f:   cats_permitidas.add(4)
+
+
+
+if not dff.empty:
+    dff["_cat"] = dff["capturas"].apply(get_semaforo_category)
+    dff = dff[dff["_cat"].isin(cats_permitidas)].drop(columns=["_cat"])
+
+st.sidebar.markdown("---")
+
+# ── MÉTODO INTERPOLACIÓN (oculto si perimetrales activo) ──
+if not st.session_state.get("incl_peri", False):
+    metodo_interp = st.sidebar.radio(
+        "🗺️ Método interpolación",
+    #    options=["GPS (si existe)", "Lotes KMZ", "Híbrido (GPS + KMZ)"],
+         options=["Lotes KMZ"],
+
+        index=0
+    )
+else:
+    metodo_interp = "GPS (si existe)"
+
+st.sidebar.markdown("---")
+
+# ── MODO VISUALIZACIÓN (oculto si perimetrales activo) ──
+if not st.session_state.get("incl_peri", False):
+    modo_color = st.sidebar.radio(
+        "🎨 Modo visualización",
+        options=["Normal", "Espectral", "Curvas de Nivel"],
+        index=0
+    )
+else:
+    modo_color = "Normal"
+
+# ── OPCIONES CURVAS NIVEL ──
+num_niveles = grosor_lineas = opacidad_relleno = None
+mostrar_etiquetas = False
+if modo_color == "Curvas de Nivel":
+    with st.sidebar.expander("⚙️ Opciones curvas", expanded=True):
+        num_niveles       = st.slider("Número de líneas",  2, 20, 10)
+        grosor_lineas     = st.slider("Grosor líneas",     1,  6,  3)
+        mostrar_etiquetas = st.checkbox("Mostrar etiquetas", value=False)
+        opacidad_relleno  = st.slider("Opacidad (%)",      0, 100, 65)
+
+if not st.session_state.get("incl_peri", False):
+    buffer_val = st.sidebar.slider("📏 Buffer trampas (°)", 0.001, 0.05, 0.010, step=0.001)
+else:
+    buffer_val = 0.010
+    
+st.sidebar.markdown("---")
+
+# ── VECTORES PROPAGACIÓN (oculto si perimetrales activo) ──
+if not st.session_state.get("incl_peri", False):
+    with st.sidebar.expander("🧭 Vectores Propagación", expanded=False):
+        mostrar_vectores = st.checkbox("Mostrar flechas", value=False, key="show_vectors")
+        if mostrar_vectores:
+            n_arrows      = st.slider("Densidad",                5, 30, 15)
+            escala_flecha = st.slider("Longitud (×10⁻⁴ °)",     1, 20,  6)
+            head_size     = st.slider("Tamaño punta (×10⁻⁵ °)", 1, 20,  6)
+            min_mag       = st.slider("Magnitud mínima",         1, 30,  5) / 100.0
+            color_flechas = st.color_picker("Color saetas", value="#1a1aff")
+else:
+    mostrar_vectores = False
+
+st.sidebar.markdown("---")
+st.sidebar.info(f"📊 **Registros:** {len(dff)}")
+
+# ── RESUMEN FILTROS ACTIVOS ──
+filtros_activos = []
+if sel_semana: filtros_activos.append(f"**Semana:** {sel_semana_val}")
+if sel_fundo:  filtros_activos.append(f"**Fundo:** {sel_fundo_val}")
+if sel_mod:    filtros_activos.append(f"**Módulo:** {sel_mod_val}")
+if sel_lote:   filtros_activos.append(f"**Lote:** {sel_lote_val}")
+if sel_turno:  filtros_activos.append(f"**Turno:** {sel_turno_val}")
+filtros_activos.append(
+    "**Trampa:** Solo Caseras Perimetrales"
+    if incluir_peri
+    else (
+        "**Trampa:** Todas (excl. Perimetrales)"
+        if sel_trampa_val == "Todos"
+        else f"**Trampa:** {sel_trampa_val}"
+    )
+)
+
+if filtros_activos:
+    st.sidebar.success("✅ Filtros activos")
+    with st.sidebar.expander("📋 Ver filtros"):
+        for fa in filtros_activos:
+            st.markdown(fa)
+# ============================================================
+# PREPARAR DATOS PARA JAVASCRIPT
+# ============================================================
+map_data           = []
+lotes_para_contorno = []
+lotes_markers      = []
+polygons_con_datos = []
+lotes_etiquetas    = []
+
+if not dff.empty:
+    from collections import defaultdict
+
+    dff_agg = dff.copy()
+    dff_agg["lote"]     = dff_agg["lote"].fillna("").astype(str).str.strip()
+    dff_agg["lat_orig"] = dff_agg["lat"].copy()
+    dff_agg["lon_orig"] = dff_agg["lon"].copy()
+    dff_agg["lat"]      = dff_agg["lat"].fillna(-9999.0)
+    dff_agg["lon"]      = dff_agg["lon"].fillna(-9999.0)
+
+    dff_agg["modulo_n"] = dff_agg["modulo"].apply(lambda x: norm_mod(str(x)))
+    dff_agg["turno_n"]  = dff_agg["turno"].apply(lambda x: norm_tur(str(x)))
+    dff_agg["lote_n"]   = dff_agg["lote"].apply(lambda x: norm_lote(str(x)))
+
+    dff_agg = (
+        dff_agg
+        .groupby(["fundo", "modulo_n", "turno_n", "lote_n", "trampa"], as_index=False)
+        .agg({
+            "capturas":    "sum",
+            "tipo_trampa": "first",
+            "lat":         "first",
+            "lon":         "first",
+            "modulo":      "first",
+            "turno":       "first",
+            "lote":        "first",
+        })
+    )
+
+    map_data      = dff_agg.to_dict("records")
+    valid         = dff_agg.copy()
+    lotes_markers = calcular_lotes_con_centroide(valid, kmz_polygons)
+
+    # ── Agrupar por turno para etiquetas ──
+    turnos_agrupados = defaultdict(lambda: {
+        "lats": [], "lons": [], "capturas": 0,
+        "lotes": [], "fundo": "", "modulo": "", "turno": "",
+        "con_kmz": False
+    })
+
+    for m in lotes_markers:
+        key = f"{m['fundo_aq']}|{m['modulo_n']}|{m['turno_n']}"
+        g = turnos_agrupados[key]
+        g["lats"].append(m["lat"])
+        g["lons"].append(m["lon"])
+        g["capturas"] += m["capturas"]
+        g["fundo"]   = m["fundo"]
+        g["modulo"]  = m["modulo"]
+        g["turno"]   = m["turno"]
+        g["con_kmz"] = g["con_kmz"] or m.get("con_kmz", False)
+        lote_val = m.get("lote", "")
+        if lote_val and lote_val not in g["lotes"]:
+            g["lotes"].append(lote_val)
+
+    for key, g in turnos_agrupados.items():
+        if g["lats"]:
+            lotes_etiquetas.append({
+                "lat":      sum(g["lats"]) / len(g["lats"]),
+                "lon":      sum(g["lons"]) / len(g["lons"]),
+                "capturas": g["capturas"],
+                "fundo":    g["fundo"],
+                "modulo":   g["modulo"],
+                "turno":    g["turno"],
+                "lotes":    sorted(g["lotes"]),
+                "n_lotes":  len(g["lotes"]),
+                "con_kmz":  g["con_kmz"],
+            })
+
+    # ── Para el gaussiano: solo lotes con centroide KMZ ──
+    lotes_para_contorno = [
+        {"lat": m["lat"], "lon": m["lon"], "capturas": m["capturas"]}
+        for m in lotes_markers
+        if m.get("con_kmz")
+    ]
+
+    # ── Polígonos KMZ que SÍ tienen datos ──
+    keys_con_datos     = set(m["key_kmz"] for m in lotes_markers if m.get("con_kmz"))
+    polygons_con_datos = []
+    for poly in kmz_polygons:
+        fundo_aq = str(poly.get("fundo_aq", "")).upper().strip()
+        mod_n    = poly.get("mod_n")
+        tur_n    = poly.get("tur_n")
+        lote_n   = norm_lote(str(poly.get("lote_name", "")))
+        key      = f"{fundo_aq}|{mod_n}|{tur_n}|{lote_n}"
+        if key in keys_con_datos:
+            polygons_con_datos.append(poly)
+
+# ── Generar contornos gaussianos solo si el modo lo requiere ──
+contornos = {"fills": [], "lines": [], "opacidad": (opacidad_relleno or 65) / 100.0}
+if modo_color in ["Curvas de Nivel", "Espectral"] and len(lotes_para_contorno) >= 3:
+    with st.spinner("Generando contornos gaussianos…"):
+        contornos = generar_contornos_gauss(
+            lotes_para_contorno,
+            polygons_con_datos,
+            num_niveles   = num_niveles   or 10,
+            grosor_lineas = grosor_lineas or 3,
+            opacidad_fill = (opacidad_relleno or 65) / 100.0,
+        )
+# ── Configuración visualización ──
+viz_config = {
+    "modo_color":        modo_color,
+    "metodo_interp":     metodo_interp,
+    "num_niveles":       num_niveles       or 10,
+    "grosor_lineas":     grosor_lineas     or 3,
+    "mostrar_etiquetas": mostrar_etiquetas,
+    "opacidad_relleno":  opacidad_relleno  or 65,
+    "buffer_val":        float(buffer_val),
+    "mostrar_vectores":  mostrar_vectores  if "mostrar_vectores" in locals() else False,
+    "n_arrows":          n_arrows          if "n_arrows"          in locals() else 15,
+    "escala_flecha":     escala_flecha     if "escala_flecha"     in locals() else 6,
+    "head_size":         head_size         if "head_size"         in locals() else 6,
+    "min_mag":           min_mag           if "min_mag"           in locals() else 0.05,
+    "color_flechas":     color_flechas     if "color_flechas"     in locals() else "#1a1aff",
+    "semaforización": {
+    "blanco":   sel_sem_blanco,
+    "verde":    sel_sem_verde,
+    "amarillo": sel_sem_amarillo,
+    "naranja":  sel_sem_naranja,
+    "rojo":     sel_sem_rojo_f,
+}
+}
+
+# ── Serializar desde lotes_markers (ya tienen centroide KMZ) ──
+map_data_optimized = [
+    {
+        "lat":      m["lat"],
+        "lon":      m["lon"],
+        "capturas": m["capturas"],
+        "fundo":    m["fundo"],
+        "modulo":   m["modulo"],
+        "turno":    m["turno"],
+        "lote":     m["lote"],
+        "trampa":   m["trampa"],
+        "con_kmz":  m.get("con_kmz", False),  # ← único cambio
+
+    }
+    for m in lotes_markers
+] if lotes_markers else []
+
+# ── JSON final (SIN token para no exponerlo en el HTML) ──
+data_json = json.dumps({
+    "data":        map_data_optimized,
+    "config":      viz_config,
+    "recordCount": len(dff),
+    "polygons":    kmz_polygons,
+    "githubToken": "",   # ← vacío, el token se usa solo en Python
+    "contornos":   contornos,
+    "lotes":       lotes_etiquetas,
+}, separators=(",", ":"), ensure_ascii=False)# ============================================================
+# PANEL DE KPIs (estilo tarjeta)
+# ============================================================
+def _calcular_semana_anterior(df_completo: pd.DataFrame, semana_actual: int | None):
+    if semana_actual is None:
+        return None
+    semanas_disponibles = sorted(df_completo["semana"].dropna().unique().tolist())
+    anteriores = [s for s in semanas_disponibles if s < semana_actual]
+    if not anteriores:
+        return None
+    semana_prev = max(anteriores)
+    return df_completo[df_completo["semana"] == semana_prev].copy()
+
+
+def _delta_pct(actual: float, anterior: float) -> float | None:
+    if not anterior or pd.isna(anterior):
+        return None
+    return ((actual - anterior) / anterior) * 100
+
+
+semana_sel_actual = int(sel_semana_val) if sel_semana_val != "Todos" else None
+df_prev = _calcular_semana_anterior(df, semana_sel_actual)
+
+capturas_totales = int(dff["capturas"].sum()) if not dff.empty else 0
+trampas_activas  = dff["trampa"].nunique() if not dff.empty else 0
+promedio_trampa  = (capturas_totales / trampas_activas) if trampas_activas else 0.0
+zonas_alerta     = sum(1 for m in lotes_markers if get_semaforo_category(m["capturas"]) == 4) if lotes_markers else 0
+
+if df_prev is not None and not df_prev.empty:
+    capturas_prev = int(df_prev["capturas"].sum())
+    trampas_prev  = df_prev["trampa"].nunique()
+    promedio_prev = (capturas_prev / trampas_prev) if trampas_prev else 0.0
+    zonas_prev    = None  # no se recalcula KMZ histórico por semana, se omite delta
+
+    delta_capturas = _delta_pct(capturas_totales, capturas_prev)
+    delta_promedio = _delta_pct(promedio_trampa,  promedio_prev)
+else:
+    delta_capturas = delta_promedio = None
+
+def _badge(delta: float | None) -> str:
+    if delta is None:
+        return ""
+    positivo = delta >= 0
+    color_bg = "#E1F5EE" if positivo else "#FAECE7"
+    color_txt = "#085041" if positivo else "#712B13"
+    flecha = "▲" if positivo else "▼"
+    return f'<span style="background:{color_bg};color:{color_txt};font-size:12px;font-weight:500;padding:2px 8px;border-radius:6px;display:inline-flex;align-items:center;gap:3px;">{flecha} {abs(delta):.1f}%</span>'
+
+def _tarjeta_kpi(icono, label, valor, sufijo_html="", color_valor="inherit"):
+    return (
+        f'<div style="background:var(--background-color,#fff);border:1px solid rgba(128,128,128,0.18);border-radius:12px;padding:16px 18px;flex:1;min-width:160px;">'
+        f'<div style="font-size:13px;color:rgba(128,128,128,0.9);margin-bottom:6px;display:flex;align-items:center;gap:6px;">'
+        f'<span>{icono}</span><span>{label}</span></div>'
+        f'<div style="font-size:26px;font-weight:600;color:{color_valor};line-height:1.2;">{valor}</div>'
+        f'<div style="margin-top:8px;min-height:22px;">{sufijo_html}</div>'
+        f'</div>'
+    )
+
+sufijo_semana = ""
+if sel_semana_val != "Todos":
+    sufijo_semana = f'<span style="font-size:12px;color:rgba(128,128,128,0.85);">Semana {sel_semana_val}</span>'
+
+kpi_html = (
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:1.2rem;">'
+    + _tarjeta_kpi("📊", "Capturas totales", f"{capturas_totales:,}", _badge(delta_capturas) or sufijo_semana)
+    + _tarjeta_kpi("📈", "Promedio / trampa", f"{promedio_trampa:.1f}", _badge(delta_promedio))
+    + _tarjeta_kpi("📍", "Trampas activas", f"{trampas_activas:,}")
+    + _tarjeta_kpi("🔴", "Zonas en alerta", f"{zonas_alerta}", color_valor="#D85A30" if zonas_alerta > 0 else "inherit")
+    + '</div>'
+)
+
+st.markdown(kpi_html, unsafe_allow_html=True)
+# ============================================================
+# GRÁFICO PASTEL — LOTES POR NIVEL DE SEMAFORIZACIÓN
+# ============================================================
+# ── FUERA de _build_pie_data_v2, función global ──
+def _cat(v):
+    v = float(v)
+    if v <= 0:   return 0
+    elif v <= 1: return 1
+    elif v <= 2: return 2
+    elif v <= 3: return 3
+    else:        return 4
+
+def _build_pie_data_v2(df_full: pd.DataFrame) -> dict:
+    trampas = sorted([t for t in df_full["trampa"].dropna().unique().tolist() if str(t).strip()])
+    semanas  = sorted(df_full["semana"].dropna().unique().astype(int).tolist())
+    por_ts   = {}
+
+    def _contar_lotes_por_cat(sub: pd.DataFrame):
+        cats = [0, 0, 0, 0, 0]
+        if sub.empty:
+            return cats
+        grp = (
+            sub.groupby(["fundo", "modulo", "turno", "lote"], as_index=False)["capturas"]
+            .sum()
+        )
+        for _, row in grp.iterrows():
+            cats[_cat(row["capturas"])] += 1
+        return cats
+
+    por_ts["TODOS"] = {}
+    for s in semanas:
+        sub = df_full[df_full["semana"] == s]
+        por_ts["TODOS"][int(s)] = _contar_lotes_por_cat(sub)
+
+    for t in trampas:
+        por_ts[t] = {}
+        for s in semanas:
+            sub = df_full[(df_full["semana"] == s) & (df_full["trampa"] == t)]
+            por_ts[t][int(s)] = _contar_lotes_por_cat(sub)
+
+    semanas = [int(s) for s in semanas]
+    return {"por_ts": por_ts, "trampas": ["TODOS"] + trampas, "semanas": semanas}
+
+
+# ── Datos ──────────────────────────────────────────────────────────────────────
+pie_data = _build_pie_data_v2(df)
+
+SEMAFORO_LABELS = ["0 capturas", "1 captura", "2 capturas", "3 capturas", "> 3 capturas"]
+SEMAFORO_COLORS = ["#a8d5a8", "#22c55e", "#eab308", "#f97316", "#ef4444"]
+
+with st.expander("Lotes por nivel de semaforización", expanded=True):
+
+    col_t, col_a, col_b, col_modo = st.columns([3, 1, 1, 2])
+
+    with col_t:
+        sel_trampa = st.selectbox("Trampa", options=pie_data["trampas"], key="pie_trampa")
+    with col_a:
+        idx_a     = max(0, len(pie_data["semanas"]) - 2)
+        sel_sem_a = st.selectbox("Semana A", options=pie_data["semanas"],
+                                  index=idx_a, key="pie_semA")
+    with col_b:
+        idx_b     = len(pie_data["semanas"]) - 1
+        sel_sem_b = st.selectbox("Semana B", options=pie_data["semanas"],
+                                  index=idx_b, key="pie_semB")
+    with col_modo:
+        modo = st.radio("Modo", options=["Una semana", "Comparar A vs B"],
+                        horizontal=True, key="pie_modo", label_visibility="collapsed")
+
+    comparar = modo == "Comparar A vs B"
+
+    def get_vals(trampa, semana):
+        if semana is None:
+            return [0, 0, 0, 0, 0]
+        ts = pie_data["por_ts"].get(trampa, {})
+        return ts.get(int(semana), [0, 0, 0, 0, 0])
+
+    vA   = get_vals(sel_trampa, sel_sem_a)
+    vB   = get_vals(sel_trampa, sel_sem_b)
+    totA = sum(vA)
+    totB = sum(vB)
+    rojA = vA[4]
+    rojB = vB[4]
+
+    # ── KPIs ──
+    if comparar:
+        delta_roj = rojB - rojA
+        k1, k2 = st.columns(2)
+        k1.metric(
+            f"🔴 Rojos sem. {sel_sem_a} → {sel_sem_b}",
+            f"{rojA} → {rojB}",
+            delta=f"{delta_roj:+d} lotes",
+            delta_color="inverse"
+        )
+        k2.metric(
+            "Variación rojos %",
+            f"{(delta_roj/rojA*100):+.1f}%" if rojA > 0 else "N/A",
+        )
+    else:
+        k1, k2 = st.columns(2)
+        k1.metric("🔴 Lotes en rojo (>3)", f"{rojA:,}")
+        k2.metric(
+            "% lotes en rojo",
+            f"{(rojA/totA*100):.1f}%" if totA > 0 else "N/A"
+        )
+
+    # ── Figura Plotly ──
+    def _make_pie(values, name):
+        return go.Pie(
+            labels=SEMAFORO_LABELS,
+            values=values,
+            hole=0.62,
+            marker=dict(colors=SEMAFORO_COLORS, line=dict(color="#ffffff", width=2)),
+            textinfo="value+percent",
+            textposition="outside",
+            outsidetextfont=dict(size=11),
+            hovertemplate="<b>%{label}</b><br>%{value} lotes<br>%{percent}<extra></extra>",
+            sort=False,
+            name=name,
+        )
+
+    if comparar:
+        fig = make_subplots(
+            rows=1, cols=2,
+            specs=[[{"type": "pie"}, {"type": "pie"}]],
+            subplot_titles=[
+                f"Semana {sel_sem_a} · {sel_trampa}",
+                f"Semana {sel_sem_b} · {sel_trampa}",
+            ]
+        )
+        fig.add_trace(_make_pie(vA, f"Sem {sel_sem_a}"), row=1, col=1)
+        fig.add_trace(_make_pie(vB, f"Sem {sel_sem_b}"), row=1, col=2)
+
+        for annotation in fig.layout.annotations:
+            annotation.y = 1.12
+            annotation.font = dict(size=13)
+
+        fig.add_annotation(
+            x=0.20, y=0.5,
+            text=f"<b>{totA}</b><br><span style='font-size:11px'>lotes</span>",
+            showarrow=False, font=dict(size=18, color="#111"),
+            xref="paper", yref="paper"
+        )
+        fig.add_annotation(
+            x=0.80, y=0.5,
+            text=f"<b>{totB}</b><br><span style='font-size:11px'>lotes</span>",
+            showarrow=False, font=dict(size=18, color="#111"),
+            xref="paper", yref="paper"
+        )
+        height = 430
+
+    else:
+        fig = make_subplots(rows=1, cols=1, specs=[[{"type": "pie"}]])
+        fig.add_trace(_make_pie(vA, f"Sem {sel_sem_a}"))
+        fig.add_annotation(
+            x=0.5, y=0.5,
+            text=f"<b>{totA}</b><br><span style='font-size:11px'>lotes</span>",
+            showarrow=False, font=dict(size=20, color="#111"),
+            xref="paper", yref="paper"
+        )
+        height = 460
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=80, r=80, t=50, b=80),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="v",
+            yanchor="middle", y=0.5,
+            xanchor="right",  x=1.18,
+            font=dict(size=12),
+            itemsizing="constant",
+        ),
+        showlegend=True,
+    )
+    st.plotly_chart(fig, use_container_width=True, key="pie_semaforo")
+
+    # ── Tablas comparativas ──
+    if comparar:
+        st.markdown("---")
+
+        def color_dif(val):
+            try:
+                n = int(val.replace("+", ""))
+                if n > 0:   return "color: #dc2626; font-weight:500"
+                elif n < 0: return "color: #16a34a; font-weight:500"
+            except Exception:
+                pass
+            return ""
+
+        # ── Tabla general por nivel ──
+        difs  = [vB[i] - vA[i] for i in range(5)]
+        tabla = {
+            "Nivel":                   SEMAFORO_LABELS,
+            f"Lotes sem. {sel_sem_a}": vA,
+            f"Lotes sem. {sel_sem_b}": vB,
+            "Dif (lotes)":             [f"{d:+}" for d in difs],
+        }
+        df_tabla = pd.DataFrame(tabla)
+        st.dataframe(
+            df_tabla.style.map(color_dif, subset=["Dif (lotes)"]),
+            use_container_width=True,
+            hide_index=True,
+            height=213,
+        )
+
+        # ── Tabla por fundo ──
+        def _contar_lotes_por_fundo_cat(sub: pd.DataFrame):
+            if sub.empty:
+                return []
+            grp = (
+                sub.groupby(["fundo", "modulo", "turno", "lote"], as_index=False)["capturas"]
+                .sum()
+            )
+            rows = []
+            for fundo, gdf in grp.groupby("fundo"):
+                cats = [0, 0, 0, 0, 0]
+                for _, row in gdf.iterrows():
+                    cats[_cat(row["capturas"])] += 1
+                for i, label in enumerate(SEMAFORO_LABELS):
+                    rows.append({"Fundo": fundo, "Nivel": label, "lotes": cats[i]})
+            return rows
+
+        df_sem_a = (
+            df[df["semana"] == sel_sem_a]
+            if sel_trampa == "TODOS"
+            else df[(df["semana"] == sel_sem_a) & (df["trampa"] == sel_trampa)]
+        )
+        df_sem_b = (
+            df[df["semana"] == sel_sem_b]
+            if sel_trampa == "TODOS"
+            else df[(df["semana"] == sel_sem_b) & (df["trampa"] == sel_trampa)]
+        )
+
+        rows_fundo_A = _contar_lotes_por_fundo_cat(df_sem_a)
+        rows_fundo_B = _contar_lotes_por_fundo_cat(df_sem_b)
+
+        st.markdown("**Detalle por fundo:**")
+        df_A = pd.DataFrame(rows_fundo_A).rename(columns={"lotes": f"Sem {sel_sem_a}"})
+        df_B = pd.DataFrame(rows_fundo_B).rename(columns={"lotes": f"Sem {sel_sem_b}"})
+
+        df_fundo = pd.merge(df_A, df_B, on=["Fundo", "Nivel"], how="outer").fillna(0)
+        df_fundo[f"Sem {sel_sem_a}"] = df_fundo[f"Sem {sel_sem_a}"].astype(int)
+        df_fundo[f"Sem {sel_sem_b}"] = df_fundo[f"Sem {sel_sem_b}"].astype(int)
+        df_fundo["Dif (lotes)"] = df_fundo.apply(
+            lambda r: f"{r[f'Sem {sel_sem_b}'] - r[f'Sem {sel_sem_a}']:+}", axis=1
+        )
+        nivel_order = {l: i for i, l in enumerate(SEMAFORO_LABELS)}
+        # ── Agregar fila TOTAL por fundo ──
+        totales = []
+        for fundo in df_fundo["Fundo"].unique():
+            sub_f = df_fundo[df_fundo["Fundo"] == fundo]
+            totales.append({
+                "Fundo":              fundo,
+                "Nivel":              "TOTAL",
+                f"Sem {sel_sem_a}":   sub_f[f"Sem {sel_sem_a}"].sum(),
+                f"Sem {sel_sem_b}":   sub_f[f"Sem {sel_sem_b}"].sum(),
+                "Dif (lotes)":        f"{sub_f[f'Sem {sel_sem_b}'].sum() - sub_f[f'Sem {sel_sem_a}'].sum():+}",
+            })
+        df_totales = pd.DataFrame(totales)
+
+        nivel_order = {l: i for i, l in enumerate(SEMAFORO_LABELS)}
+        nivel_order["TOTAL"] = 99  # ← TOTAL va al final de cada fundo
+        df_fundo["_ord"] = df_fundo["Nivel"].map(nivel_order)
+        df_totales["_ord"] = 99
+
+        df_fundo = pd.concat([df_fundo, df_totales], ignore_index=True)
+        df_fundo = df_fundo.sort_values(["Fundo", "_ord"]).drop(columns=["_ord"])
+
+        def color_fundo(row):
+            if row["Nivel"] == "TOTAL":
+                return ["font-weight:bold; background:#f0f0f0"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            df_fundo.style
+                .map(color_dif, subset=["Dif (lotes)"])
+                .apply(color_fundo, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+        )
+
+# ============================================================
+# GRÁFICO DE TENDENCIA — LOTES EN ROJO (>3 capturas), POR SEMANA Y FUNDO
+# ============================================================
+def _build_trend_rojo_por_fundo(df_full: pd.DataFrame, trampa_sel: str) -> dict:
+    sub = df_full if trampa_sel == "TODOS" else df_full[df_full["trampa"] == trampa_sel]
+    fundos  = sorted([f for f in sub["fundo"].dropna().unique().tolist() if str(f).strip()])
+    semanas = sorted(sub["semana"].dropna().unique().astype(int).tolist())
+
+    data = {f: {} for f in fundos}
+    for f in fundos:
+        sub_f = sub[sub["fundo"] == f]
+        for s in semanas:
+            sub_fs = sub_f[sub_f["semana"] == s]
+            if sub_fs.empty:
+                data[f][s] = 0
+                continue
+            grp = sub_fs.groupby(["modulo", "turno", "lote"], as_index=False)["capturas"].sum()
+            data[f][s] = int((grp["capturas"].apply(_cat) == 4).sum())
+
+    return {"data": data, "fundos": fundos, "semanas": semanas}
+
+
+with st.expander("📈 Tendencia semanal — Lotes > 3 capturas por fundo", expanded=True):
+
+    trend_data    = _build_trend_rojo_por_fundo(df, sel_trampa)
+    semanas_tend  = trend_data["semanas"]
+    fundos_tend   = trend_data["fundos"]
+
+    fig_trend = go.Figure()
+    for f in fundos_tend:
+        serie_f = [trend_data["data"][f].get(s, 0) for s in semanas_tend]
+        fig_trend.add_trace(go.Scatter(
+            x=semanas_tend,
+            y=serie_f,
+            mode="lines+markers",
+            name=f,
+            marker=dict(size=6),
+            line=dict(width=2.5),
+            hovertemplate=f"<b>{f}</b><br>Semana %{{x}}: %{{y}} lotes<extra></extra>",
+        ))
+
+    fig_trend.update_layout(
+        title=f"Trampa: {sel_trampa}",
+        height=400,
+        margin=dict(l=60, r=30, t=50, b=50),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(title="Semana", dtick=1, gridcolor="rgba(128,128,128,0.15)"),
+        yaxis=dict(title="N° de lotes > 3 capturas", gridcolor="rgba(128,128,128,0.15)"),
+        legend=dict(title="Fundo", orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5),
+        hovermode="x unified",
+    )
+
+    st.plotly_chart(fig_trend, use_container_width=True, key="trend_semaforo")
+
+# ==================================================
+# MAPA CON COMPONENTE JAVASCRIPT
+# ============================================================
+st.markdown("## 🗺️ Mapa Epidemiológico")
+
+html_file = Path(__file__).parent / "mapa_streamlit_js.html"
+
+if html_file.exists():
+    with open(html_file, "r", encoding="utf-8") as f:
+        html_content = f.read()
+else:
+    html_content = """
+    <div style="display:flex;align-items:center;justify-content:center;height:950px;
+                background:#f5f5f5;color:#666;">
+        <div>⚠️ Archivo mapa_streamlit_js.html no encontrado.
+             Colócalo en la misma carpeta que este script.</div>
+    </div>
+    """
+
+html_with_data = f"""
+<script>
+    window.streamlitData = {data_json};
+</script>
+{html_content}
+"""
+# ── TABLA DE MATCHES / NO MATCHES ──
+if lotes_markers:
+    import pandas as pd
+    
+    con_kmz  = [m for m in lotes_markers if m.get("con_kmz")]
+    sin_kmz  = [m for m in lotes_markers if not m.get("con_kmz")]
+
+    # Construir tabla de sin match
+    rows_sin = []
+    for row in valid.to_dict("records"):
+        fundo_aq = fundo_to_aq(str(row.get("fundo", "")))
+        mod_n    = norm_mod(str(row.get("modulo", "")))
+        tur_n    = norm_tur(str(row.get("turno",  "")))
+        lote_n   = norm_lote(str(row.get("lote",  "")))
+        if not fundo_aq or not mod_n or not tur_n:
+            continue
+        key = f"{fundo_aq}|{mod_n}|{tur_n}|{lote_n}"
+        # buscar si tiene match
+        found = any(m["key_kmz"] == key for m in lotes_markers if m.get("con_kmz"))
+        if not found:
+            # buscar similares en KMZ
+            similares = [
+                k for k in [
+                    f"{p['fundo_aq']}|{p['mod_n']}|{p['tur_n']}|{norm_lote(str(p['lote_name']))}"
+                    for p in kmz_polygons
+                ]
+                if k.split('|')[0] == (fundo_aq or '') 
+                and k.split('|')[1] == str(mod_n or '')
+            ]
+            rows_sin.append({
+                "Fundo":    row.get("fundo", ""),
+                "Módulo":   row.get("modulo", ""),
+                "Turno":    row.get("turno",  ""),
+                "Lote":     row.get("lote",   ""),
+                "Key Excel": key,
+                "Keys KMZ disponibles": ", ".join(sorted(set(similares))[:4]) or "❌ Sin módulo en KMZ",
+            })
+
+
+    if rows_sin:
+        with st.expander(f"⚠️ {len(rows_sin)} lotes sin match KMZ — ver detalle", expanded=False):
+            df_sin = pd.DataFrame(rows_sin)
+            st.dataframe(
+                df_sin,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Key Excel":             st.column_config.TextColumn(width="medium"),
+                    "Keys KMZ disponibles":  st.column_config.TextColumn(width="large"),
+                }
+            )
+st.components.v1.html(html_with_data, height=950, width=None)
+
+# ============================================================
+# ============================================================
+# ============================================================
+# EXPORTAR HTML → GITHUB PAGES
+# ============================================================
+GITHUB_TOKEN  = st.secrets.get("GITHUB_TOKEN",  "")
+GITHUB_OWNER  = st.secrets.get("GITHUB_OWNER",  "controloperacionalprize-boss")
+GITHUB_REPO   = st.secrets.get("GITHUB_REPO",   "mapa_html")
+GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
+GITHUB_FILE   = "mapa_mosca.html"
+
+def _push_file_github(api_url, contenido, branch, mensaje, headers, es_binario=False):
+    import base64, urllib.request, urllib.error, json
+    sha = None
+    try:
+        req  = urllib.request.Request(api_url + f"?ref={branch}", headers=headers)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read())
+        sha  = data.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            pass
+        else:
+            return False, f"Error leyendo archivo ({e.code})"
+    except Exception as ex:
+        return False, f"Error de red: {ex}"
+    content_b64 = (
+        base64.b64encode(contenido).decode()
+        if es_binario
+        else base64.b64encode(contenido.encode("utf-8")).decode()
+    )
+    payload = {"message": mensaje, "content": content_b64, "branch": branch}
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+        resp = urllib.request.urlopen(req, timeout=60)
+        result = json.loads(resp.read())
+        sha_nuevo = result.get("content", {}).get("sha", "")
+        return True, ""
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        return False, f"GitHub API error {e.code}: {body}"
+    except Exception as ex:
+        return False, f"Error: {ex}"
+
+def _build_sufijo():
+    import re as _re_fn
+    _partes = ["A2026"]
+
+    if sel_semana:
+        _partes.append("S" + "-".join(map(str, sorted(sel_semana))))
+
+    if sel_fundo_val and sel_fundo_val != "Todos":
+        fundo_limpio = sel_fundo_val.replace(" ", "_")
+        _partes.append(f"F-{fundo_limpio}")
+
+    if st.session_state.get("incl_peri", False):
+        _partes.append("T-PERIMETRALES")
+    elif sel_trampa_val and sel_trampa_val != "Todos":
+        trampa_limpia = sel_trampa_val.replace(" ", "_")[:20]
+        _partes.append(f"T-{trampa_limpia}")
+
+    sufijo = "_".join(_partes) if _partes else "SinFiltro"
+    return _re_fn.sub(r'[^A-Za-z0-9_\-]', '', sufijo)[:60]
+
+
+def _build_carpeta():
+    """Carpeta base según semana seleccionada"""
+    if sel_semana:
+        semana_str = "S" + "-".join(map(str, sorted(sel_semana)))
+        return semana_str
+    return "SinSemana"
+
+def _build_headers():
+    return {
+        "Authorization":        f"Bearer {GITHUB_TOKEN}",
+        "Accept":               "application/vnd.github+json",
+        "Content-Type":         "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _subir_html_a_github(html_content):
+    import datetime
+    if not GITHUB_TOKEN:
+        return False, "No se encontró GITHUB_TOKEN en secrets.toml"
+
+    headers   = _build_headers()
+    base_repo = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents"
+    sufijo    = _build_sufijo()
+    carpeta   = _build_carpeta()
+    ts        = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    mensaje   = f"Mapa actualizado {ts} | {sufijo}"
+
+    html_limpio = html_content.replace(
+        "<head>",
+        "<head>\n"
+        '<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">\n'
+        '<meta http-equiv="Pragma" content="no-cache">\n'
+        '<meta http-equiv="Expires" content="0">\n'
+    )
+
+    # ── Archivo fijo (siempre sobreescribe) ──
+    ok1, res1 = _push_file_github(
+        f"{base_repo}/{GITHUB_FILE}",
+        html_limpio, GITHUB_BRANCH, mensaje, headers
+    )
+    if not ok1:
+        return False, f"Error subiendo archivo fijo: {res1}"
+
+    # ── Histórico con estructura: historico/S5/mapa_A2026_S5_F-ARENA_AZUL_T-JACKSON.html ──
+    nombre_h = f"historico/{carpeta}/mapa_{sufijo}.html"
+    _push_file_github(
+        f"{base_repo}/{nombre_h}",
+        html_limpio, GITHUB_BRANCH, mensaje, headers
+    )
+
+    url_historico = f"https://{GITHUB_OWNER}.github.io/{GITHUB_REPO}/{nombre_h}"
+    return True, url_historico
+
+def _subir_png_a_github(png_bytes):
+    import datetime
+    if not GITHUB_TOKEN:
+        return False, "No se encontró GITHUB_TOKEN en secrets.toml"
+
+    headers   = _build_headers()
+    base_repo = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents"
+    sufijo    = _build_sufijo()
+    carpeta   = _build_carpeta()
+    ts        = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    mensaje   = f"PNG generado {ts} | {sufijo}"
+
+    # ── Estructura: historico_png/S5/mapa_A2026_S5_F-ARENA_AZUL_T-JACKSON.png ──
+    nombre = f"historico_png/{carpeta}/mapa_{sufijo}.png"
+
+    ok, res = _push_file_github(
+        f"{base_repo}/{nombre}",
+        png_bytes, GITHUB_BRANCH, mensaje, headers, es_binario=True
+    )
+    if ok:
+        return True, f"https://{GITHUB_OWNER}.github.io/{GITHUB_REPO}/{nombre}"
+    return False, res
+
+# ── Botones en sidebar ──
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🌐 Publicar")
+col_pub, col_png = st.sidebar.columns([1, 1])
+
+with col_pub:
+    if st.button("🚀 Publicar HTML", use_container_width=True, key="btn_pub_html"):
+        with st.spinner("Publicando Pagina..."):
+            ok, resultado = _subir_html_a_github(html_with_data)
+        if ok:
+            st.sidebar.success("✅ Publicado")
+            st.sidebar.markdown(f"[🔗 Ver mapa]({resultado})", unsafe_allow_html=True)
+        else:
+            st.sidebar.error(resultado)
+with col_png:
+    if st.button("🖼️ PNG", use_container_width=True, key="btn_png"):
+        with st.spinner("Capturando mapa..."):
+            tmp_html = None
+            js_log_data = {}  # ← Aquí guardaremos los logs internos del mapa
+            try:
+                import platform
+                from PIL import Image
+                import io, tempfile, os
+
+                # ── Guardar HTML temporal ──
+                tmp_html = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".html", mode="w", encoding="utf-8"
+                )
+                tmp_html.write(html_with_data)
+                tmp_html.close()
+
+                png_bytes = None
+
+                if platform.system() == "Windows":
+                    # ── LOCAL: usar Selenium ──
+                    from selenium import webdriver
+                    from selenium.webdriver.chrome.options import Options
+                    from selenium.webdriver.chrome.service import Service
+                    from selenium.webdriver.common.by import By
+                    from webdriver_manager.chrome import ChromeDriverManager
+                    import time
+
+                    opts = Options()
+                    opts.add_argument("--headless=new")
+                    opts.add_argument("--no-sandbox")
+                    opts.add_argument("--disable-dev-shm-usage")
+                    opts.add_argument("--disable-gpu")
+                    opts.add_argument("--window-size=1920,1080")
+                    opts.add_argument("--force-device-scale-factor=2")
+
+                    service = Service(ChromeDriverManager().install())
+                    driver  = webdriver.Chrome(service=service, options=opts)
+                    driver.set_window_size(1920, 1080)
+                    driver.get(f"file:///{tmp_html.name}")
+                    time.sleep(5)
+
+                    try:
+                        driver.execute_script("""
+                            try {
+                                activarModoPNGGeneral();
+                            } catch(e) {
+                                console.error('Error PNG modo:', e);
+                            }
+                        """)
+                        time.sleep(2)
+
+                        # ← FORZAR ZOOM Y EXTRAER TELEMETRÍA A STREAMLIT
+                        js_log_data = driver.execute_script("""
+                            let res = { motor: 'Selenium (Windows)', capas_con_bounds: 0, bounds_detectados: null, zoom_inicial: null, zoom_final: null, error_js: null };
+                            try {
+                                if (!window.map) {
+                                    res.error_js = 'window.map no está definido en el HTML';
+                                    return res;
+                                }
+                                res.zoom_inicial = window.map.getZoom();
+                                
+                                let bounds = null;
+                                window.map.eachLayer(function(layer) {
+                                    if (layer.getBounds && typeof layer.getBounds === 'function') {
+                                        try {
+                                            const b = layer.getBounds();
+                                            if (b && b.isValid()) {
+                                                const c = b.getCenter();
+                                                // Ignorar puntos corruptos o vacíos en el origen [0,0] que arruinan el zoom
+                                                if (Math.abs(c.lat) > 0.5 && Math.abs(c.lng) > 0.5) {
+                                                    res.capas_con_bounds++;
+                                                    bounds = bounds ? bounds.extend(b) : b;
+                                                }
+                                            }
+                                        } catch(err) {}
+                                    }
+                                });
+                                
+                                if (bounds && bounds.isValid()) {
+                                    res.bounds_detectados = [
+                                        [bounds.getSouthWest().lat, bounds.getSouthWest().lng],
+                                        [bounds.getNorthEast().lat, bounds.getNorthEast().lng]
+                                    ];
+                                    
+                                    // Ajustar al recuadro con margen moderado
+                                    window.map.fitBounds(bounds, { padding: [10, 10] });
+                                    window.map.setZoom(window.map.getZoom() + 1);
+                                    // Sin offset adicional: fitBounds ya eligió el zoom óptimo
+                                    let zActual = window.map.getZoom();
+                                    
+                                    res.zoom_final = window.map.getZoom();
+                                } else {
+                                    res.error_js = 'No se encontraron capas con límites geométricos válidos.';
+                                }
+                            } catch(e) {
+                                res.error_js = e.message;
+                            }
+                            return res;
+                        """)
+                        time.sleep(3)
+
+                    except Exception as e:
+                        js_log_data = {"error_selenium_python": str(e)}
+
+                    # Fix emoji/animacion
+                    try:
+                        driver.execute_script("""
+                            const style = document.createElement('style');
+                            style.textContent = '* { animation: none !important; }';
+                            document.head.appendChild(style);
+                            document.querySelectorAll('.leaflet-marker-icon').forEach(el => {
+                                el.style.visibility = 'visible';
+                                el.style.opacity = '1';
+                            });
+                            if (window.map) window.map.invalidateSize(true);
+                        """)
+                        time.sleep(2)
+                    except Exception:
+                        pass
+
+                    try:
+                        map_el    = driver.find_element(By.ID, "mapContainer")
+                        png_bytes = map_el.screenshot_as_png
+                    except Exception:
+                        png_bytes = driver.get_screenshot_as_png()
+
+                    driver.quit()
+
+                else:
+                    # ── CLOUD: usar Playwright ──
+                    from playwright.sync_api import sync_playwright
+                    os.system("playwright install chromium")
+
+                    with sync_playwright() as p:
+                        browser = p.chromium.launch(
+                            headless=True,
+                            args=[
+                                "--no-sandbox",
+                                "--disable-dev-shm-usage",
+                                "--disable-gpu",
+                                "--disable-web-security",
+                                "--allow-file-access-from-files",
+                            ]
+                        )
+                        page = browser.new_page(
+                            viewport={"width": 1920, "height": 1080},
+                            device_scale_factor=2,
+                        )
+                        page.goto(f"file://{tmp_html.name}", wait_until="networkidle")
+                        page.wait_for_timeout(3000)
+
+                        try:
+                            page.evaluate("""
+                                () => { activarModoPNGGeneral(); }
+                            """)
+                        except Exception:
+                            pass
+
+                        page.wait_for_timeout(2000)
+
+                        # ← FORZAR ZOOM Y EXTRAER TELEMETRÍA DESDE PLAYWRIGHT
+                        try:
+                            js_log_data = page.evaluate("""
+                                () => {
+                                    let res = { motor: 'Playwright (Cloud)', capas_con_bounds: 0, bounds_detectados: null, zoom_inicial: null, zoom_final: null, error_js: null };
+                                    try {
+                                        if (!window.map) {
+                                            res.error_js = 'window.map no está definido';
+                                            return res;
+                                        }
+                                        res.zoom_inicial = window.map.getZoom();
+                                        
+                                        let bounds = null;
+                                        window.map.eachLayer(function(layer) {
+                                            if (layer.getBounds && typeof layer.getBounds === 'function') {
+                                                try {
+                                                    const b = layer.getBounds();
+                                                    if (b && b.isValid()) {
+                                                        const c = b.getCenter();
+                                                        if (Math.abs(c.lat) > 0.5 && Math.abs(c.lng) > 0.5) {
+                                                            res.capas_con_bounds++;
+                                                            bounds = bounds ? bounds.extend(b) : b;
+                                                        }
+                                                    }
+                                                } catch(err) {}
+                                            }
+                                        });
+                                        if (bounds && bounds.isValid()) {
+                                            res.bounds_detectados = [
+                                                [bounds.getSouthWest().lat, bounds.getSouthWest().lng],
+                                                [bounds.getNorthEast().lat, bounds.getNorthEast().lng]
+                                            ];
+                                            window.map.fitBounds(bounds, { padding: [10, 10] }); // Margen moderado
+                                            res.zoom_final = window.map.getZoom();
+                                        } else {
+                                            res.error_js = 'No se encontraron límites válidos';
+                                        }
+                                    } catch(e) {
+                                        res.error_js = e.message;
+                                    }
+                                    return res;
+                                }
+                            """)
+                        except Exception as e:
+                            js_log_data = {"error_playwright_python": str(e)}
+
+                        page.wait_for_timeout(3000)
+
+                        try:
+                            page.evaluate("""
+                                () => {
+                                    const style = document.createElement('style');
+                                    style.textContent = '* { animation: none !important; }';
+                                    document.head.appendChild(style);
+                                    document.querySelectorAll('.leaflet-marker-icon').forEach(el => {
+                                        el.style.visibility = 'visible';
+                                        el.style.opacity    = '1';
+                                        el.style.display    = 'block';
+                                    });
+                                    if (window.map) window.map.invalidateSize(true);
+                                }
+                            """)
+                        except Exception:
+                            pass
+
+                        try:
+                            page.wait_for_selector(".leaflet-tile-loaded", timeout=15000)
+                        except Exception:
+                            pass
+
+                        page.wait_for_timeout(4000)
+
+                        try:
+                            png_bytes = page.locator("#mapContainer").screenshot()
+                        except Exception:
+                            png_bytes = page.screenshot(full_page=False)
+
+                        browser.close()
+
+                if png_bytes:
+                    img = Image.open(io.BytesIO(png_bytes))
+                    st.sidebar.caption(f"📐 {img.width}×{img.height}px")
+
+                    ok_png, res_png = _subir_png_a_github(png_bytes)
+                    if ok_png:
+                        st.sidebar.success("✅ PNG publicado")
+                        st.sidebar.markdown(f"[🔗 Ver PNG]({res_png})", unsafe_allow_html=True)
+
+                        import base64
+                        nombre_png = f"mapa_mosca_{_build_sufijo()}.png"
+                        b64 = base64.b64encode(png_bytes).decode()
+                        st.components.v1.html(
+                            f"""
+                            <html><body>
+                            <script>
+                            (function() {{
+                                try {{
+                                    const b64 = '{b64}';
+                                    const bin = atob(b64);
+                                    const arr = new Uint8Array(bin.length);
+                                    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                                    const blob = new Blob([arr], {{type: 'image/png'}});
+                                    const url  = URL.createObjectURL(blob);
+                                    const a    = document.createElement('a');
+                                    a.href     = url;
+                                    a.download = '{nombre_png}';
+                                    document.body.appendChild(a);
+                                    a.click();
+                                    document.body.removeChild(a);
+                                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                                }} catch(e) {{
+                                    console.error('descarga error:', e);
+                                }}
+                            }})();
+                            </script>
+                            </body></html>
+                            """,
+                            height=0,
+                        )
+                    else:
+                        st.sidebar.warning(f"PNG local OK, GitHub falló: {res_png}")  
+            except Exception as e:
+                st.sidebar.error(f"Error generando PNG: {e}")
+                import traceback
+                st.sidebar.error(traceback.format_exc())
+            finally:
+                try:
+                    if tmp_html:
+                        os.unlink(tmp_html.name)
+                except Exception:
+                    pass
