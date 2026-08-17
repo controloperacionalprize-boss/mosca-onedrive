@@ -124,7 +124,7 @@ def get_semaforo_category(val: float) -> int:
     elif v <= 1:  return 1  # verde
     elif v <= 2:  return 2  # amarillo
     elif v <= 3:  return 3  # naranja
-    else:         return 4  # rojo
+    else:         return 4  # rojo (≥4)
 
 
 # ============================================================
@@ -419,7 +419,7 @@ def generar_contornos_gauss(
     z_valid = Z_masked[~np.isnan(Z_masked)]
     z_min   = float(z_valid.min())
 
-    # ── Semáforo fijo: verde=0, amarillo=1, naranja=2, rojo=3+ ──
+    # ── Semáforo fijo: verde=0, amarillo=1, naranja=2-3, rojo=≥4 ──
     vmin = 0
     vmax = max(4.0, z_max_real)
     colors_semaforo = [
@@ -427,7 +427,7 @@ def generar_contornos_gauss(
     (1 / vmax, "#00FF00"),  # verde       → 1
     (2 / vmax, "#FFFF00"),  # amarillo    → 2
     (3 / vmax, "#FFA500"),  # naranja     → 3
-    (4 / vmax, "#FF0000"),  # rojo        → >3
+    (4 / vmax, "#FF0000"),  # rojo        → ≥4
     (1.0,      "#FF0000"),
 ]
     cmap = mcolors.LinearSegmentedColormap.from_list(
@@ -892,7 +892,6 @@ _MSAL_AUTHORITY = "https://login.microsoftonline.com/common"
 _MSAL_SCOPES    = ["https://graph.microsoft.com/Files.Read.All"]
 
 # Ruta SharePoint expresada como Drive path de Graph API
-# "Documentos compartidos" es el nombre del drive, NO una subcarpeta
 _SP_HOST       = "aquanqape.sharepoint.com"
 _SP_SITE_PATH  = "/sites/OficinasPrizePeru"
 _SP_FOLDER     = "PowerBI Global/02.-BI-Administracion Agricola/Fitosanidad/Mosca_Fruta"
@@ -955,8 +954,6 @@ def _graph_get(url: str, token: str) -> dict:
 
 
 def _graph_download(url: str, token: str) -> bytes:
-    # Graph devuelve 302 → URL real del archivo; urllib sigue el redirect
-    # pero el segundo request ya no necesita el token de Auth
     import urllib.error
     req = urllib.request.Request(
         url,
@@ -1211,8 +1208,8 @@ st.sidebar.markdown("**Filtro por semaforización:**")
 sel_sem_blanco   = st.sidebar.checkbox("⚪ 0 capturas",   value=True, key="sem_blanco")
 sel_sem_verde    = st.sidebar.checkbox("🟢 1 captura",    value=True, key="sem_verde")
 sel_sem_amarillo = st.sidebar.checkbox("🟡 2 capturas",   value=True, key="sem_amarillo")
-sel_sem_naranja  = st.sidebar.checkbox("🟠 3 capturas",   value=True, key="sem_naranja")
-sel_sem_rojo_f   = st.sidebar.checkbox("🔴 > 3 capturas", value=True, key="sem_rojo")
+sel_sem_naranja  = st.sidebar.checkbox("🟠 3 capturas",    value=True, key="sem_naranja")
+sel_sem_rojo_f   = st.sidebar.checkbox("🔴 ≥ 4 capturas", value=True, key="sem_rojo")
 
 cats_permitidas = set()
 if sel_sem_blanco:   cats_permitidas.add(0)
@@ -1546,7 +1543,7 @@ def _cat(v):
     elif v <= 1: return 1
     elif v <= 2: return 2
     elif v <= 3: return 3
-    else:        return 4
+    else:        return 4  # ≥4
 
 def _build_pie_data_v2(df_full: pd.DataFrame) -> dict:
     trampas = sorted([t for t in df_full["trampa"].dropna().unique().tolist() if str(t).strip()])
@@ -1583,8 +1580,8 @@ def _build_pie_data_v2(df_full: pd.DataFrame) -> dict:
 # ── Datos ──────────────────────────────────────────────────────────────────────
 pie_data = _build_pie_data_v2(df)
 
-SEMAFORO_LABELS = ["0 capturas", "1 captura", "2 capturas", "3 capturas", "> 3 capturas"]
-SEMAFORO_COLORS = ["#a8d5a8", "#22c55e", "#eab308", "#f97316", "#ef4444"]
+SEMAFORO_LABELS = ["0 capturas", "1 captura", "2 capturas", "3 capturas", "≥ 4 capturas"]
+SEMAFORO_COLORS = ["#a8d5a8", "#22c55e", "#eab308", "#f97316", "#FF0000"]
 
 with st.expander("Lotes por nivel de semaforización", expanded=True):
 
@@ -1635,7 +1632,7 @@ with st.expander("Lotes por nivel de semaforización", expanded=True):
         )
     else:
         k1, k2 = st.columns(2)
-        k1.metric("🔴 Lotes en rojo (>3)", f"{rojA:,}")
+        k1.metric("🔴 Lotes en rojo (≥4)", f"{rojA:,}")
         k2.metric(
             "% lotes en rojo",
             f"{(rojA/totA*100):.1f}%" if totA > 0 else "N/A"
@@ -1820,7 +1817,7 @@ with st.expander("Lotes por nivel de semaforización", expanded=True):
         )
 
 # ============================================================
-# GRÁFICO DE TENDENCIA — LOTES EN ROJO (>3 capturas), POR SEMANA Y FUNDO
+# GRÁFICO DE TENDENCIA — LOTES EN ROJO (>4 capturas), POR SEMANA Y FUNDO
 # ============================================================
 def _build_trend_rojo_por_fundo(df_full: pd.DataFrame, trampa_sel: str) -> dict:
     sub = df_full if trampa_sel == "TODOS" else df_full[df_full["trampa"] == trampa_sel]
@@ -1841,7 +1838,7 @@ def _build_trend_rojo_por_fundo(df_full: pd.DataFrame, trampa_sel: str) -> dict:
     return {"data": data, "fundos": fundos, "semanas": semanas}
 
 
-with st.expander("📈 Tendencia semanal — Lotes > 3 capturas por fundo", expanded=True):
+with st.expander("📈 Tendencia semanal — Lotes > 4 capturas por fundo", expanded=True):
 
     trend_data    = _build_trend_rojo_por_fundo(df, sel_trampa)
     semanas_tend  = trend_data["semanas"]
@@ -1867,7 +1864,7 @@ with st.expander("📈 Tendencia semanal — Lotes > 3 capturas por fundo", expa
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(title="Semana", dtick=1, gridcolor="rgba(128,128,128,0.15)"),
-        yaxis=dict(title="N° de lotes > 3 capturas", gridcolor="rgba(128,128,128,0.15)"),
+        yaxis=dict(title="N° de lotes > 4 capturas", gridcolor="rgba(128,128,128,0.15)"),
         legend=dict(title="Fundo", orientation="h", yanchor="bottom", y=1.05, xanchor="center", x=0.5),
         hovermode="x unified",
     )
