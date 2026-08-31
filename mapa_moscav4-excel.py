@@ -944,27 +944,44 @@ def _get_graph_token() -> str | None:
     return result["access_token"]
 
 
-def _graph_get(url: str, token: str) -> dict:
+def _graph_get(url: str, token: str, _retries: int = 4) -> dict:
+    import time, urllib.error
     req = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return _json.loads(resp.read())
+    for attempt in range(_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return _json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < _retries - 1:
+                wait = int(e.headers.get("Retry-After", 2 ** (attempt + 1)))
+                time.sleep(wait)
+                continue
+            raise
 
 
-def _graph_download(url: str, token: str) -> bytes:
-    import urllib.error
+def _graph_download(url: str, token: str, _retries: int = 4) -> bytes:
+    import time, urllib.error
     req = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {token}"},
     )
     opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
-    with opener.open(req, timeout=120) as resp:
-        return resp.read()
+    for attempt in range(_retries):
+        try:
+            with opener.open(req, timeout=120) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < _retries - 1:
+                wait = int(e.headers.get("Retry-After", 2 ** (attempt + 1)))
+                time.sleep(wait)
+                continue
+            raise
 
 
-@st.cache_data(show_spinner="Descargando Excel desde SharePoint…", ttl=300)
+@st.cache_data(show_spinner="Descargando Excel desde SharePoint…", ttl=900)
 def _descargar_excels_sharepoint(token: str) -> list[bytes]:
     # 1. Obtener el ID del site
     site_url = (
