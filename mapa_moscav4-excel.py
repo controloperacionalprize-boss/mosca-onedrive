@@ -2256,115 +2256,98 @@ with col_png:
                     driver.quit()
 
                 else:
-                    # ── CLOUD: usar Playwright ──
-                    from playwright.sync_api import sync_playwright
-                    os.system("playwright install chromium")
+                    # ── CLOUD: usar Selenium con Chromium de Linux ──
+                    from selenium import webdriver
+                    from selenium.webdriver.chrome.options import Options
+                    from selenium.webdriver.chrome.service import Service
+                    from selenium.webdriver.common.by import By
+                    import time
 
-                    with sync_playwright() as p:
-                        browser = p.chromium.launch(
-                            headless=True,
-                            args=[
-                                "--no-sandbox",
-                                "--disable-dev-shm-usage",
-                                "--disable-gpu",
-                                "--disable-web-security",
-                                "--allow-file-access-from-files",
-                            ]
-                        )
-                        page = browser.new_page(
-                            viewport={"width": 1920, "height": 1080},
-                            device_scale_factor=2,
-                        )
-                        page.goto(f"file://{tmp_html.name}", wait_until="networkidle")
-                        page.wait_for_timeout(3000)
+                    opts = Options()
+                    opts.add_argument("--headless=new")
+                    opts.add_argument("--no-sandbox")
+                    opts.add_argument("--disable-dev-shm-usage")
+                    opts.add_argument("--disable-gpu")
+                    opts.add_argument("--window-size=1920,1080")
+                    opts.add_argument("--force-device-scale-factor=2")
 
-                        try:
-                            page.evaluate("""
-                                () => { activarModoPNGGeneral(); }
-                            """)
-                        except Exception:
-                            pass
+                    driver = webdriver.Chrome(options=opts)
+                    driver.set_window_size(1920, 1080)
+                    driver.get(f"file:///{tmp_html.name}")
+                    time.sleep(5)
 
-                        page.wait_for_timeout(2000)
+                    try:
+                        driver.execute_script("""
+                            try { activarModoPNGGeneral(); } catch(e) {}
+                        """)
+                        time.sleep(2)
 
-                        # ← FORZAR ZOOM Y EXTRAER TELEMETRÍA DESDE PLAYWRIGHT
-                        try:
-                            js_log_data = page.evaluate("""
-                                () => {
-                                    let res = { motor: 'Playwright (Cloud)', capas_con_bounds: 0, bounds_detectados: null, zoom_inicial: null, zoom_final: null, error_js: null };
-                                    try {
-                                        if (!window.map) {
-                                            res.error_js = 'window.map no está definido';
-                                            return res;
-                                        }
-                                        res.zoom_inicial = window.map.getZoom();
-                                        
-                                        let bounds = null;
-                                        window.map.eachLayer(function(layer) {
-                                            if (layer.getBounds && typeof layer.getBounds === 'function') {
-                                                try {
-                                                    const b = layer.getBounds();
-                                                    if (b && b.isValid()) {
-                                                        const c = b.getCenter();
-                                                        if (Math.abs(c.lat) > 0.5 && Math.abs(c.lng) > 0.5) {
-                                                            res.capas_con_bounds++;
-                                                            bounds = bounds ? bounds.extend(b) : b;
-                                                        }
-                                                    }
-                                                } catch(err) {}
-                                            }
-                                        });
-                                        if (bounds && bounds.isValid()) {
-                                            res.bounds_detectados = [
-                                                [bounds.getSouthWest().lat, bounds.getSouthWest().lng],
-                                                [bounds.getNorthEast().lat, bounds.getNorthEast().lng]
-                                            ];
-                                            window.map.fitBounds(bounds, { padding: [10, 10] }); // Margen moderado
-                                            res.zoom_final = window.map.getZoom();
-                                        } else {
-                                            res.error_js = 'No se encontraron límites válidos';
-                                        }
-                                    } catch(e) {
-                                        res.error_js = e.message;
-                                    }
+                        js_log_data = driver.execute_script("""
+                            let res = { motor: 'Selenium (Cloud)', capas_con_bounds: 0, bounds_detectados: null, zoom_inicial: null, zoom_final: null, error_js: null };
+                            try {
+                                if (!window.map) {
+                                    res.error_js = 'window.map no está definido';
                                     return res;
                                 }
-                            """)
-                        except Exception as e:
-                            js_log_data = {"error_playwright_python": str(e)}
-
-                        page.wait_for_timeout(3000)
-
-                        try:
-                            page.evaluate("""
-                                () => {
-                                    const style = document.createElement('style');
-                                    style.textContent = '* { animation: none !important; }';
-                                    document.head.appendChild(style);
-                                    document.querySelectorAll('.leaflet-marker-icon').forEach(el => {
-                                        el.style.visibility = 'visible';
-                                        el.style.opacity    = '1';
-                                        el.style.display    = 'block';
-                                    });
-                                    if (window.map) window.map.invalidateSize(true);
+                                res.zoom_inicial = window.map.getZoom();
+                                let bounds = null;
+                                window.map.eachLayer(function(layer) {
+                                    if (layer.getBounds && typeof layer.getBounds === 'function') {
+                                        try {
+                                            const b = layer.getBounds();
+                                            if (b && b.isValid()) {
+                                                const c = b.getCenter();
+                                                if (Math.abs(c.lat) > 0.5 && Math.abs(c.lng) > 0.5) {
+                                                    res.capas_con_bounds++;
+                                                    bounds = bounds ? bounds.extend(b) : b;
+                                                }
+                                            }
+                                        } catch(err) {}
+                                    }
+                                });
+                                if (bounds && bounds.isValid()) {
+                                    res.bounds_detectados = [
+                                        [bounds.getSouthWest().lat, bounds.getSouthWest().lng],
+                                        [bounds.getNorthEast().lat, bounds.getNorthEast().lng]
+                                    ];
+                                    window.map.fitBounds(bounds, { padding: [10, 10] });
+                                    res.zoom_final = window.map.getZoom();
+                                } else {
+                                    res.error_js = 'No se encontraron límites válidos';
                                 }
-                            """)
-                        except Exception:
-                            pass
+                            } catch(e) {
+                                res.error_js = e.message;
+                            }
+                            return res;
+                        """)
+                        time.sleep(3)
 
-                        try:
-                            page.wait_for_selector(".leaflet-tile-loaded", timeout=15000)
-                        except Exception:
-                            pass
+                    except Exception as e:
+                        js_log_data = {"error_selenium_cloud": str(e)}
 
-                        page.wait_for_timeout(4000)
+                    try:
+                        driver.execute_script("""
+                            const style = document.createElement('style');
+                            style.textContent = '* { animation: none !important; }';
+                            document.head.appendChild(style);
+                            document.querySelectorAll('.leaflet-marker-icon').forEach(el => {
+                                el.style.visibility = 'visible';
+                                el.style.opacity = '1';
+                                el.style.display = 'block';
+                            });
+                            if (window.map) window.map.invalidateSize(true);
+                        """)
+                        time.sleep(2)
+                    except Exception:
+                        pass
 
-                        try:
-                            png_bytes = page.locator("#mapContainer").screenshot()
-                        except Exception:
-                            png_bytes = page.screenshot(full_page=False)
+                    try:
+                        map_el = driver.find_element(By.ID, "mapContainer")
+                        png_bytes = map_el.screenshot_as_png
+                    except Exception:
+                        png_bytes = driver.get_screenshot_as_png()
 
-                        browser.close()
+                    driver.quit()
 
                 if png_bytes:
                     img = Image.open(io.BytesIO(png_bytes))
